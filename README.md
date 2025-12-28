@@ -25,6 +25,12 @@ Install these on your build/flash host (Linux/macOS/Windows with suitable substi
 - Run `./scripts/dev-setup.sh` to install common tooling (git, curl, python3, jq, openssl), Android platform tools (adb, fastboot), and optional helpers (avbtool, usbutils). Supports apt, dnf, or Homebrew; otherwise install the equivalents manually.
 - Configure GitHub auth (PAT or SSH keys) if you need to push branches or open PRs.
 
+## Agent-first experience
+- The UX is agent-first (voice/chat), optimized for mobile but scales to desktop. A “classic” Android-like mode remains available.
+- System apps and GUI are designed to be driven by the on-device agent, with optional cloud fallbacks.
+- Users can supply API keys for OpenAI and other providers (e.g., Anthropic, local endpoints) to run agent inference via third-party services; billing flows remain with those providers.
+- Default goal is on-device inference using our neural architecture; cloud keys are optional. Protect keys in secure storage and gate network calls on explicit user consent.
+
 ## Licensing and compliance
 - This repo’s content is MIT-licensed. Keep the MIT notice when you reuse/redistribute this code.
 - Upstream components carry their own licenses: AOSP pieces are typically Apache 2.0/BSD; the Linux kernel is GPLv2 (obligates you to share kernel source + modifications when you distribute binaries); vendor firmware/drivers and proprietary APKs are usually closed and require explicit OEM/vendor permission to redistribute.
