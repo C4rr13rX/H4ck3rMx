@@ -24,3 +24,12 @@ Install these on your build/flash host (Linux/macOS/Windows with suitable substi
 ## Development environment setup
 - Run `./scripts/dev-setup.sh` to install common tooling (git, curl, python3, jq, openssl), Android platform tools (adb, fastboot), and optional helpers (avbtool, usbutils). Supports apt, dnf, or Homebrew; otherwise install the equivalents manually.
 - Configure GitHub auth (PAT or SSH keys) if you need to push branches or open PRs.
+
+## Licensing and compliance
+- This repo’s content is MIT-licensed. Keep the MIT notice when you reuse/redistribute this code.
+- Upstream components carry their own licenses: AOSP pieces are typically Apache 2.0/BSD; the Linux kernel is GPLv2 (obligates you to share kernel source + modifications when you distribute binaries); vendor firmware/drivers and proprietary APKs are usually closed and require explicit OEM/vendor permission to redistribute.
+- To stay legal and reach the same outcome:
+  - Prefer AOSP sources and open drivers where available; keep full source and license notices.
+  - For proprietary blobs/apps, use user-supplied sideload flows or obtain redistribution rights; do not bundle without permission.
+  - Maintain a NOTICE/THIRD_PARTY file enumerating all third-party components and their licenses.
+  - When shipping kernels or other copyleft pieces, publish matching source and build instructions for any released binaries.
