@@ -45,7 +45,8 @@ class W1z4rDV1510nAgentBridge:
         # Prohibited actions conflicting with the foundational commandments
         self.forbidden_intent_keywords = [
             "steal", "exfiltrate_private_keys", "spy_on_user", "falsify_logs",
-            "install_backdoor", "bypass_hex_trust", "destroy_user_data", "lie_to_user"
+            "install_backdoor", "bypass_hex_trust", "destroy_user_data", "lie_to_user",
+            "surveillance", "backdoor", "coercion", "intercept_private_keys", "unauthorized"
         ]
 
     def evaluate_invariants(self, intent: str) -> Tuple[bool, str]:
