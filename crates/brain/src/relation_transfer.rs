@@ -1,0 +1,812 @@
+//! SUBJECT-PRESERVING RELATION TRANSFER -- a bounded fallback for held-out
+//! relation questions, guarded by the production derivation's negative verdict.
+//!
+//! # Production fallback
+//!
+//! `derive_by_relation_transfer` is called by `Brain::integrate_autonomous`
+//! only after substitution returns no answer and reports a completed negative
+//! taught-subquestion verdict. This keeps the scorecard and node answer routes
+//! on the same path. The public composition wrapper remains for route parity
+//! checks and callers that need explicit probe accounting.
+//!
+//! # Historical measurement that motivated this mechanism
+//!
+//! At the scale-1 symbol world, composed as a FALLBACK behind the existing
+//! `derive_by_substitution` (fires only when that returns nothing):
+//!
+//! ```text
+//!   ALL FAMILIES base 42/54 (77.8%) probes 1083
+//!             -> fallback 49/54 (90.7%) probes 1131   (+4.4% probes)
+//!   beside_next under the fallback arm: right 6 of 6
+//!   recall after both arms 186/186
+//! ```
+//!
+//! Priced against the post-`dea50bd` four-scale baseline, which solved
+//! `on_material` (1534/1536) and `next_color` (1024/1024) outright and left
+//! `beside_next` byte-identical at 0/384, that family is **384 of the 785
+//! misses remaining at scale 64 -- 48.9 %** and the only bucket with a
+//! mechanism already measured to answer it.
+//!
+//! # What the existing derivation cannot do, stated without naming a word
+//!
+//! Every match in this world is precision x recall over the UNORDERED DISTINCT
+//! BYTE SET. For a held-out probe of the shape `<subject> <relation>?`, the
+//! relation's bytes outnumber the subject's: modelling the matcher's own scorer
+//! over 186 trained questions gives the same reading for all six held-out
+//! probes -- the top match is UNIQUE at 0.9000 and is the WRONG SUBJECT, while
+//! the trained question that holds the answer sits at rank 44. So the relation
+//! outweighs the subject 9:1, and any mechanism that reaches the relation drags
+//! the wrong subject along with it. That is neither a tie-break problem nor a
+//! budget problem, and no reordering or wider budget supplies the missing span:
+//! `derive_by_substitution` can only insert spans taken from an ANSWER, and the
+//! span needed here only ever appears inside a trained QUESTION.
+//!
+//! # The mechanism
+//!
+//! 1. A query scoring below the ceiling has a best trained answer `A`.
+//! 2. REVERSE-decode `A` -- observe it in the answer pool, decode into the query
+//!    pool -- giving a trained question `T` that produces `A`. `T` names the
+//!    neighbourhood the query landed in, including its subject.
+//! 3. Align query and `T` on their common prefix and suffix, giving the span
+//!    that differs.
+//! 4. Splice spans of `T` over spans of the query. A rewrite scoring at the
+//!    ceiling IS a question the brain was taught, so a wrong span cannot win --
+//!    it can only cost a probe.
+//!
+//! # ALIGNMENT ALONE CANNOT SEPARATE THE SUBJECT FROM THE RELATION
+//!
+//! This was asserted the other way round first and the unit test refuted it, so
+//! it is recorded here rather than rediscovered. For query `"r001 beside?"` and
+//! trained question `"r000 next?"` the common prefix is 3 bytes and the common
+//! suffix is 1, so the aligned substitution is
+//! `"r00" ++ "0 next" ++ "?"` = **`"r000 next?"`** -- the WRONG SUBJECT. The
+//! borrowed span straddles the subject byte and the relation, because the two
+//! differences are adjacent and the alignment has no way to cut between them.
+//!
+//! What actually preserves the subject is the TAIL transfer: `query[..a] ++
+//! T[i..]`, which cuts at the subject/relation boundary instead of at the common
+//! prefix. At `a == i == 4` that is `"r001" ++ " next?"` = `"r001 next?"`, the
+//! wanted rewrite, and the `|a - i|` ordering puts it at candidate 5 of 4,395.
+//! So the aligned candidate is kept because it is cheap and sometimes right, not
+//! because it is the one the mechanism relies on.
+//!
+//! Step 4's accept rule is the one `derive_by_substitution` already uses. The
+//! only new idea is that the INSERT may come from a trained QUESTION rather
+//! than only from an ANSWER.
+//!
+//! # HALLUCINATION, AND THE RULE THAT CEILING-SCORING ALONE IS NOT ENOUGH
+//!
+//! The first version of this module returned the FIRST rewrite that scored at
+//! the ceiling and resolved to something new. That is not safe, and the number
+//! says so rather than an argument. Composed as a fallback over the scale-1
+//! world, counting `wrong` as well as `right` -- which the design suite never
+//! did, because its only assertion was `right` must not fall:
+//!
+//! ```text
+//!        beside_next  base 0 right  0 wrong  6 empty -> 6 right  0 wrong  0 empty
+//!   next_on_material  base 4 right  0 wrong  4 empty -> 4 right  4 WRONG  0 empty
+//!        on_material  base 22 right 0 wrong  2 empty -> 23 right 1 WRONG  0 empty
+//! ```
+//!
+//! Every silence became an answer: `empty` went to 0 in all three. So the
+//! headline "42/54 -> 49/54" was +7 right bought with **+5 wrong**, a NET of
+//! +2 against a brain whose measured `wrong` is 0 at every scale -- and the
+//! project's first standard is that a brain with no grounded answer has NO
+//! answer.
+//!
+//! The cause is structural, not a threshold: a rewrite can be an exactly
+//! trained question (score 1.0) and still return the answer to a DIFFERENT
+//! question than the one asked. For a one-hop family the single reachable
+//! rewrite is the right one; for a multi-hop family several distinct trained
+//! questions are reachable at the ceiling and the first one found is arbitrary.
+//!
+//! So the accept rule is the owner's: an answer is returned only when the chain
+//! is **UNIQUE**. Every distinct ceiling-reachable answer inside the budget is
+//! collected; exactly one is returned, and two or more abstains immediately --
+//! a second distinct answer settles it, because no further probe can make a
+//! non-unique chain unique. This is what makes the mechanism silent where it
+//! used to invent, and it costs the multi-hop families nothing they had.
+//!
+//! # EXHAUSTIVE REWRITES ARE A TEST ORACLE, NOT THE SCORECARD PATH
+//!
+//! The `!truncated` condition remains on the exhaustive oracle: a partial
+//! rewrite list cannot prove that its answer is unique. `candidate_rewrites`
+//! generates at most `1 + |q| |T|` candidates. If that upper bound does not
+//! fit the caller's budget, the scorecard path uses exact trained frames
+//! already routed by the active query scope instead of raising the budget or
+//! claiming uniqueness from a truncated rewrite list.
+//!
+//! # UNIQUENESS NOW COMES FROM THE ACTIVE BINDING SCOPE
+//!
+//! The older reading "s32 beside_next 4 right 3 WRONG 17 empty" is superseded.
+//! With the active-scope proof and an unchanged baseline, the public test reads:
+//!
+//! ```text
+//! s8  beside_next  budget 32:  6 right 0 wrong 0 empty; 18 net probes / 6 answers
+//! s32 beside_next  budget 32: 24 right 0 wrong 0 empty; 72 net probes / 24 answers
+//! ```
+//!
+//! The active query lights 10 query-pool neurons and routes 186 bindings at 8
+//! rooms, and 10 neurons / 512 bindings at 32 rooms. The proof scans the exact
+//! ordered frames in that active scope, keeps only frames admitted by the
+//! subject-preserving transfer span, and accepts one distinct answer. It uses
+//! three fallback probes per returned answer, net of the production arm. The
+//! same test runs the exhaustive rewrite path as an oracle; its answer counts
+//! and wrong counts match at both sizes, and recall remains complete.
+
+use crate::brain::Brain;
+use crate::neuron::PoolId;
+use std::collections::HashSet;
+
+/// A rewrite is accepted only at the exact ceiling, which is the score of a
+/// question the brain was actually taught. Shared with `derive_by_substitution`
+/// by value rather than by import so this module depends on nothing private.
+const CEILING: f32 = 1.0;
+
+/// Longest common prefix and suffix of two byte strings, as byte counts. What
+/// lies between them is what differs, and that is the substitution.
+fn align(a: &[u8], b: &[u8]) -> (usize, usize) {
+    let p = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let max_s = a.len().min(b.len()) - p;
+    let s = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(max_s)
+        .take_while(|(x, y)| x == y)
+        .count();
+    (p, s)
+}
+
+/// Score, matched trained question, and answer of a question, through the
+/// routed binding matcher and pair decoder. Read-only on the fabric: it must
+/// not train.
+fn ask_with_question(
+    brain: &mut Brain,
+    query_pool: PoolId,
+    answer_pool: PoolId,
+    question: &[u8],
+) -> (f32, Option<Vec<u8>>, Option<Vec<u8>>) {
+    brain.observe_fabric_read_only(query_pool, question);
+    let score = brain
+        .best_binding_match_routed(query_pool, Some(answer_pool))
+        .score();
+    let (matched_question, answer) = match brain.decode_best_trained_binding_pair(query_pool, answer_pool) {
+        Some((q, a)) => (
+            Some(q).filter(|q| !q.is_empty()),
+            Some(a).filter(|a| !a.is_empty()),
+        ),
+        None => (None, None),
+    };
+    (score, matched_question, answer)
+}
+
+/// Score and answer of a candidate rewrite.
+fn ask(
+    brain: &mut Brain,
+    query_pool: PoolId,
+    answer_pool: PoolId,
+    question: &[u8],
+) -> (f32, Option<Vec<u8>>) {
+    let (score, _, answer) = ask_with_question(brain, query_pool, answer_pool, question);
+    (score, answer)
+}
+
+/// Three-way alignment across `(query, base_question, trained)`.
+///
+/// Two-way alignment `(query, trained)` compares a held-out question directly
+/// against the reverse-decoded question `trained`, which collapses two distinct
+/// steps into one diff:
+/// 1. `query <-> base_question`: the subject span that changed when `query`
+///    matched the nearest trained question `base_question`.
+/// 2. `base_question <-> trained`: the relation span that changed when
+///    `base_answer` reverse-decoded to `trained`.
+///
+/// When `query` (`"r001 beside?"`) and `base_question` (`"r012 beside?"`)
+/// disagree in more than the last byte of the subject, two-way alignment
+/// against `trained` (`"r012 next?"`) sees `p = 2` (`"r0"`) and cannot tell
+/// where the subject ends and the relation begins, so `candidate_rewrites`
+/// splices inside the subject at `a = 3, i = 3` (`"r002 next?"`), hitting a
+/// second trained room and forcing the uniqueness check to abstain.
+///
+/// Aligning through `base_question` separates the two spans without naming any
+/// token or byte: in `base_question`, the subject disagreement `[p_ca ..
+/// len - s_ca]` must precede and be disjoint from the relation disagreement
+/// `[p_ab .. len - s_ab]`. That fixes the exact prefix of `query` that holds
+/// the subject and the suffix of `trained` that holds the transferred relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransferSpan {
+    query_prefix_len: usize,
+    trained_suffix_start: usize,
+}
+
+impl TransferSpan {
+    fn admits(&self, query: &[u8], trained: &[u8], rewrite: &[u8]) -> bool {
+        let prefix = &query[..self.query_prefix_len];
+        let suffix = &trained[self.trained_suffix_start..];
+        rewrite.len() == prefix.len() + suffix.len()
+            && rewrite.starts_with(prefix)
+            && rewrite.ends_with(suffix)
+    }
+}
+
+fn orthogonal_transfer_span(
+    query: &[u8],
+    base_question: &[u8],
+    trained: &[u8],
+) -> Option<TransferSpan> {
+    let (p_ca, s_ca) = align(query, base_question);
+    if p_ca + s_ca >= query.len() || p_ca + s_ca >= base_question.len() {
+        return None;
+    }
+    let (p_ab, s_ab) = align(base_question, trained);
+    if p_ab + s_ab >= base_question.len() || p_ab + s_ab >= trained.len() {
+        return None;
+    }
+    let subj_end_in_base = base_question.len() - s_ca;
+    if subj_end_in_base > p_ab {
+        return None;
+    }
+    let shared_tail_from_rel = base_question.len() - p_ab;
+    if shared_tail_from_rel > query.len() {
+        return None;
+    }
+    Some(TransferSpan {
+        query_prefix_len: query.len() - shared_tail_from_rel,
+        trained_suffix_start: p_ab,
+    })
+}
+
+/// REVERSE decode: observe an ANSWER and read back a trained QUESTION that
+/// produces it. This is the one call the transfer needs that the existing
+/// derivation never makes. `decode_best_trained_binding` refuses
+/// `query_pool == target_pool`, so the pools are genuinely swapped here.
+fn reverse(brain: &mut Brain, query_pool: PoolId, answer_pool: PoolId, answer: &[u8]) -> Option<Vec<u8>> {
+    brain.observe_fabric_read_only(answer_pool, answer);
+    brain
+        .decode_best_trained_binding(answer_pool, query_pool)
+        .filter(|q| !q.is_empty())
+}
+
+/// The ordered candidate rewrites, cheapest-to-be-right first. Split out from
+/// the probing loop so the ORDER -- which is the entire cost of the mechanism --
+/// can be tested without a brain.
+///
+/// Ordering is not cosmetic. Sorting the tail transfers by insert LENGTH
+/// measured 50.0 probes per derivation; sorting by `|a - i|`, the pairs whose
+/// borrowed tail starts where the query's own tail starts, puts the correct
+/// rewrite among the first few, because two questions about the same KIND of
+/// thing carry their relation at nearly the same offset.
+pub fn candidate_rewrites(query: &[u8], trained: &[u8]) -> Vec<Vec<u8>> {
+    let q = query;
+    let tb = trained;
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+
+    // The aligned substitution first: it is the one the alignment argues for.
+    let (p, s) = align(q, tb);
+    if p + s < q.len() && p + s < tb.len() {
+        let mut first = Vec::with_capacity(tb.len());
+        first.extend_from_slice(&q[..p]);
+        first.extend_from_slice(&tb[p..tb.len() - s]);
+        first.extend_from_slice(&q[q.len() - s..]);
+        candidates.push(first);
+    }
+
+    // Then tail transfers, ordered by alignment rather than by length: keep `a`
+    // bytes of what was asked, borrow the relation from `i`. Ties go to the
+    // longer borrow, which replaces more of the relation and less of the
+    // subject.
+    let mut tails: Vec<(usize, usize)> = Vec::new();
+    for a in 0..q.len() {
+        for i in 0..tb.len() {
+            tails.push((a, i));
+        }
+    }
+    tails.sort_by_key(|(a, i)| (a.abs_diff(*i), std::cmp::Reverse(tb.len() - i)));
+    for (a, i) in tails {
+        let mut rw = Vec::with_capacity(a + (tb.len() - i));
+        rw.extend_from_slice(&q[..a]);
+        rw.extend_from_slice(&tb[i..]);
+        if rw != q && !rw.is_empty() {
+            candidates.push(rw);
+        }
+    }
+
+    // THE EXHAUSTIVE SPAN-OVER-SPAN CLASS IS GONE, AND IT WAS REMOVED BY A
+    // MEASUREMENT RATHER THAN BY TASTE. It was every contiguous span of
+    // `trained` over every contiguous span of the query, longest insert first,
+    // justified by "the accept-at-ceiling rule makes an exhaustive search safe:
+    // a wrong span cannot win, it can only cost a probe". Two numbers refute
+    // the second half.
+    //
+    // (1) IT COULD NEVER BE EXAMINED, AND IT TOOK THE VERDICT WITH IT. The
+    //     class is `O(|q|^2 |T|^2)` -- 4,290 of the 4,395 candidates for a
+    //     12-byte query, 97.6 % -- against a probe budget of 64. So the loop
+    //     below always broke on `probes >= max_probes`, and the accept rule
+    //     requires `!truncated`, because "no second answer was found" is only
+    //     evidence of uniqueness if the search could have found one. Measured:
+    //     with the class present, `beside_next` is 0/6 at scale 1 on the wired
+    //     production path -- where the same mechanism measured 6/6 before the
+    //     truncation rule existed. The gate was right and unreachable: a
+    //     candidate class that cannot be exhausted cannot produce a verdict,
+    //     which is this repository's standing "a guard keyed on evidence the
+    //     host cannot produce is inert" in its purest form.
+    //
+    // (2) IT IS THE RAM BREACH. The vector is built EAGERLY, so its length is
+    //     an allocation and not a bound: 216,225 `Vec<u8>`s for a 30-byte
+    //     three-hop question against 4,395 for a 12-byte one-hop question.
+    //     Measured as a near-constant `peak_mb` adder of +8.0/+8.1/+9.1/+5.8 MB
+    //     across the four scales -- constant because it tracks question LENGTH,
+    //     not world size -- which is +36 % at scale 16 against a +15 % gate.
+    //
+    // What remains is `1 + |q| |T|` candidates: the aligned substitution and
+    // the tail transfers. That is the class the mechanism's own argument is
+    // about (see the module doc: the aligned candidate is kept because it is
+    // cheap, and the TAIL transfer is the one that cuts at the subject/relation
+    // boundary), it is bounded by the two questions' lengths, and it is small
+    // enough to EXHAUST -- so `answers.len() == 1` becomes a measurement
+    // instead of an artefact of where the budget ran out.
+    candidates
+}
+
+/// Derive an answer by SUBJECT-PRESERVING RELATION TRANSFER, reporting the
+/// number of fabric probes spent so its cost is readable the way
+/// `derive_by_substitution_profiled` reports its own.
+///
+/// Intended composition is a FALLBACK: call it only when the existing
+/// derivation returned nothing. Composed that way it cannot cost a family a
+/// correct answer, because every probe the production path already answers
+/// never reaches this function -- which is the property
+/// `as_a_fallback_the_transfer_cannot_cost_a_family` asserts per family.
+///
+/// Returns `None` rather than a guess unless the active binding scope or the
+/// exhaustive oracle establishes exactly one subject-preserving answer.
+pub fn derive_by_relation_transfer(
+    brain: &mut Brain,
+    query_pool: PoolId,
+    answer_pool: PoolId,
+    query: &[u8],
+    max_probes: usize,
+) -> (Option<Vec<u8>>, usize) {
+    let mut probes = 1usize;
+    let (base_score, base_question, base_answer) =
+        ask_with_question(brain, query_pool, answer_pool, query);
+    if base_score >= CEILING && brain.is_trained_frame(query_pool, query) {
+        return (base_answer, probes);
+    }
+    let (Some(base_question), Some(base_answer)) = (base_question, base_answer) else {
+        return (None, probes);
+    };
+
+    // Name the neighbourhood the query landed in: a trained question that
+    // produces the answer the query was about to return.
+    probes += 1;
+    let Some(trained) = reverse(brain, query_pool, answer_pool, &base_answer) else {
+        return (None, probes);
+    };
+
+    let Some(span) = orthogonal_transfer_span(query, &base_question, &trained) else {
+        return (None, probes);
+    };
+
+    // When the rewrite class cannot fit inside the caller's real probe
+    // budget, prove uniqueness over the bindings already routed by the active
+    // query firing scope. This visits the fabric's stored ordered frames once;
+    // it neither creates candidate rewrites nor observes them one by one.
+    let candidate_upper_bound = 1usize.saturating_add(query.len().saturating_mul(trained.len()));
+    if max_probes < probes.saturating_add(candidate_upper_bound) {
+        if probes >= max_probes {
+            return (None, probes);
+        }
+        probes += 1;
+        let mut answers = HashSet::new();
+        for (question, answer) in brain.active_binding_scope_pairs(query_pool, answer_pool) {
+            if answer != base_answer
+                && span.admits(query, &trained, &question)
+                && brain.is_trained_frame(query_pool, &question)
+            {
+                answers.insert(answer);
+                if answers.len() > 1 {
+                    return (None, probes);
+                }
+            }
+        }
+        return match answers.into_iter().next() {
+            Some(answer) => (Some(answer), probes),
+            None => (None, probes),
+        };
+    }
+
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    // EVERY distinct answer reachable at the ceiling inside the budget, not the
+    // first one. See `UNIQUENESS` below for why the first one is not safe.
+    let mut answers: Vec<Vec<u8>> = Vec::new();
+    // Of the answers above, the ones reached by a SUBJECT-PRESERVING rewrite.
+    // Kept beside `answers` rather than replacing it: see `AT THE ACCEPT`.
+    let mut preserving: Vec<Vec<u8>> = Vec::new();
+    // Did the search END, or did it merely STOP? See `TRUNCATION` at the accept.
+    let mut truncated = false;
+    let candidates = candidate_rewrites(query, &trained);
+    for rewrite in candidates {
+        if probes >= max_probes {
+            truncated = true;
+            break;
+        }
+        if !seen.insert(rewrite.clone()) {
+            continue;
+        }
+        // Check 3-way span alignment and exact trained-frame membership in the
+        // sequence index before probing the fabric. An untaught candidate can
+        // never pass `admissible`, and probing it through `ask` would trigger
+        // the fuzzy feature/motif route and page in up to 512 cold binding
+        // bodies from `.wbrain`.
+        if !span.admits(query, &trained, &rewrite) || !brain.is_trained_frame(query_pool, &rewrite)
+        {
+            continue;
+        }
+        probes += 1;
+        let (score, answer) = ask(brain, query_pool, answer_pool, &rewrite);
+        if score < CEILING {
+            continue;
+        }
+        if let Some(answer) = answer {
+            // The rewrite must have asked something DIFFERENT from what the
+            // query already resolved to, or the transfer has only rediscovered
+            // the wrong-subject neighbour it started from.
+            if answer != base_answer && !answers.contains(&answer) {
+                if admissible(brain, query_pool, query, &trained, &rewrite) {
+                    preserving.push(answer.clone());
+                }
+                answers.push(answer);
+                // Two distinct answers already settle it: the chain is not
+                // unique, so no further probe can make it unique.
+                if answers.len() > 1 {
+                    return (None, probes);
+                }
+            } else if answer != base_answer
+                && !preserving.contains(&answer)
+                && admissible(brain, query_pool, query, &trained, &rewrite)
+            {
+                // Same answer, reached again by a rewrite that DOES preserve
+                // the subject. The uniqueness test has already counted this
+                // answer once; what is new is the evidence about how it was
+                // reached, and that is what the accept reads.
+                preserving.push(answer);
+            }
+        }
+    }
+    if answers.len() == 1 && preserving.contains(&answers[0]) && !truncated {
+        return (Some(answers.remove(0)), probes);
+    }
+    (None, probes)
+}
+
+/// May this rewrite's answer be RETURNED? Two necessary conditions, both at the
+/// accept and neither on the search.
+///
+/// # ORDER. `score >= CEILING` does not mean "a question the brain was taught"
+///
+/// `best_binding_match_v2` scores precision x recall over the UNORDERED
+/// DISTINCT BYTE SET, so an anagram of a trained question reaches the exact
+/// ceiling -- and a rewrite that keeps the query's own subject can therefore
+/// resolve against a trained question of a DIFFERENT subject. That is why
+/// subject preservation alone measured exactly inert: all four inventions
+/// survived it, so the fault was never in the splice.
+///
+/// `Brain::is_trained_frame` is FNV-1a over the pool id and the frame BYTES, so
+/// it is order- and multiplicity-sensitive where the matcher is not. The
+/// production derivation already admits only rewrites that are in it; this
+/// mechanism accepted on the score alone, which is the whole gap.
+///
+/// This is the owner's rule stated in code: *an answer is returned only when
+/// every step of its derivation is an EXACT, ORDERED trained binding and the
+/// chain is UNIQUE*. Uniqueness is the caller's test over the answer SET;
+/// these two are the test on the DERIVATION.
+///
+/// # BOTH CONDITIONS ARE MEASURED INERT ON THIS WORLD, and that is the finding
+///
+/// Kept because they are the stated rule and cost nothing, NOT because they are
+/// what makes the mechanism safe -- it is not safe, and nothing here makes it
+/// so. Measured 2026-10-01 at scales 1 and 4 through
+/// `tests/integration_family_counts.rs`, the per-family counts are
+/// byte-identical with each condition and without it:
+///
+/// ```text
+///   uniqueness over the ceiling answer set    NOT inert (invention 5 -> 3)
+///   preserves_subject, at the accept          EXACTLY INERT
+///   is_trained_frame, ORDER-sensitive         EXACTLY INERT
+/// ```
+///
+/// So the four remaining inventions come from rewrites that are byte-exact
+/// trained questions, present in the ordered digest, keeping the query's own
+/// subject. They are legitimate taught text asking THE WRONG QUESTION, and the
+/// first diagnosis -- that the unordered byte-set matcher was the fault
+/// (`f711d18a`) -- does not survive this: order was added and changed nothing.
+///
+/// The limit is semantic and no accept rule on the rewrite reaches it. The one
+/// condition that separates the family this mechanism answers from the ones it
+/// invents on is HOP COUNT: `beside_next` is a held-out SYNONYM of a trained
+/// relation, so the rewrite's answer is identical to the query's; `on_material`
+/// and `next_on_material` are COMPOSITIONS that no single trained question
+/// answers. Firing the transfer only when the production derivation found no
+/// taught sub-question at all is therefore the gate. The profiled production
+/// derivation now reports whether its search found one, completed without one,
+/// or could not reach a verdict; only the completed negative result permits
+/// this transfer.
+fn admissible(
+    brain: &Brain,
+    query_pool: PoolId,
+    query: &[u8],
+    trained: &[u8],
+    rewrite: &[u8],
+) -> bool {
+    brain.is_trained_frame(query_pool, rewrite) && preserves_subject(query, trained, rewrite)
+}
+
+/// Does `rewrite` keep the QUERY's byte at the first position where the query
+/// and the reverse-decoded trained question `trained` disagree?
+///
+/// # AT THE ACCEPT, NOT AT THE SEARCH -- and that distinction is the whole
+/// reason this exists after the same idea was measured to fail
+///
+/// Filtering the CANDIDATE SET to subject-preserving rewrites took
+/// `next_on_material` from 2 wrong to 4 wrong (recorded at `README.md:556`),
+/// because the candidates it removed were the ones producing a SECOND distinct
+/// answer -- and a second distinct answer is what triggers the abstain.
+/// Pruning the search destroys the evidence of absence while leaving the
+/// conclusion.
+///
+/// This condition is therefore applied to the ONE ANSWER RETURNED and to
+/// nothing else: every candidate is still asked, every distinct answer still
+/// counts toward uniqueness, and what changes is only whether the surviving
+/// answer is allowed out. Uniqueness is a test on the ANSWER SET; this is a
+/// test on the DERIVATION, so composing them is strictly narrowing and cannot
+/// convert a silence into an answer.
+///
+/// # What it assumes, stated because it is an assumption and not a measurement
+///
+/// `align` finds the common prefix `p`, so `query[p]` is the first byte that is
+/// the query's own rather than borrowed. Requiring `rewrite[p] == query[p]`
+/// assumes the differing SUBJECT is at or after that first disagreement -- in
+/// `"r001 beside?"` against `"r000 next?"`, `p == 3` and the subject's last
+/// byte is exactly there, which is why the wrong-subject rewrite `"r000 next?"`
+/// takes `trained[3]` and the wanted `"r001 next?"` keeps `query[3]`. It is the
+/// same structural assumption the `|a - i|` candidate ordering already encodes
+/// and it is not a probe's wording: no relation word, family or hop count
+/// appears here. A world whose subject followed its relation would need the
+/// mirror condition on the common SUFFIX, and this function would then be
+/// measurably inert rather than silently wrong -- `preserving` would be empty
+/// and the mechanism would abstain everywhere.
+fn preserves_subject(query: &[u8], trained: &[u8], rewrite: &[u8]) -> bool {
+    let (p, _) = align(query, trained);
+    // The query is a prefix of the trained question: it has no byte of its own
+    // to preserve, so there is nothing for a rewrite to drop.
+    if p >= query.len() {
+        return true;
+    }
+    rewrite.get(p) == query.get(p)
+}
+
+/// Public composition helper for comparing substitution plus relation
+/// transfer with independently accounted probes. Production calls the bounded
+/// transfer from `Brain::integrate_autonomous` after its negative verdict.
+///
+/// # Why this measured wrapper remains outside `derive_by_substitution`
+///
+/// `f16e499d` specified the wiring as a fallback *inside*
+/// `derive_by_substitution_profiled`. That would have put it in `brain.rs`,
+/// and two measured properties argue for this placement instead of that one.
+///
+/// When this wrapper was introduced, `tests/relation_transfer_derivation.rs`
+/// needed to compare the transfer against substitution alone: the transfer
+/// derived at least one `beside_next` that substitution could not. A fallback
+/// inside `derive_by_substitution_profiled` would have made that comparison
+/// self-referential. Production now composes the mechanisms in
+/// `integrate_autonomous`; this wrapper remains for independent probe
+/// accounting and the historical comparison.
+///
+/// Second, `derive_by_substitution_profiled` owns the probe accounting the
+/// starvation work reads (`derivation_starved`, probes/attempt). Folding a
+/// second mechanism's probes into that counter would move a number another
+/// agent is measuring against, for no gain -- so the transfer reports its own
+/// cost, as the second element of the returned pair.
+///
+/// # What it cannot cost
+///
+/// The transfer fires only on an empty production answer, so every query the
+/// production path already answers returns byte-identically and spends zero
+/// extra probes. That is the property
+/// `as_a_fallback_the_transfer_cannot_cost_a_family` asserts per family.
+///
+/// `query` is the question's bytes. The caller has already observed them --
+/// `integrate_autonomous` recovers the question from `recent_frames` and
+/// cannot take it as an argument -- but the transfer asks REWRITES, which were
+/// never observed, so it needs the bytes explicitly.
+pub fn answer_with_relation_transfer(
+    brain: &mut Brain,
+    query_pool: PoolId,
+    answer_pool: PoolId,
+    query: &[u8],
+    fabric_confidence_threshold: f32,
+    chain_max_depth: usize,
+    chain_max_visit: usize,
+) -> (Option<Vec<u8>>, usize) {
+    let direct = brain
+        .integrate_autonomous(
+            query_pool,
+            answer_pool,
+            fabric_confidence_threshold,
+            chain_max_depth,
+            chain_max_visit,
+        )
+        .answer
+        .filter(|a| !a.is_empty());
+    if direct.is_some() {
+        return (direct, 0);
+    }
+    // The same budget gate `integrate_autonomous` applies to its own
+    // derivation arm: a brain configured not to derive does not derive here
+    // either, and there is one setting rather than two.
+    let budget = brain.derivation_probe_budget();
+    if budget == 0 {
+        return (None, 0);
+    }
+    // THE SAME SUB-QUESTION VERDICT THE WIRED PATH APPLIES, read off the brain
+    // rather than re-derived here. `integrate_autonomous` above has just run
+    // substitution, so this status belongs to THIS question. Only a completed
+    // scan that found no exact taught sub-question licenses the transfer.
+    //
+    // It is here as well as in `Brain::integrate_autonomous` because this
+    // function is the OUTER composition, and the parity test asserts that
+    // composing the transfer over a path that already contains it changes
+    // nothing. Gate in one place only and the outer call answers questions the
+    // product refuses, which is the scorecard-vs-node divergence the project
+    // forbids.
+    //
+    // `None` means the substitution did not conclude; that is not evidence of
+    // absence. Only `Some(false)` licenses the transfer.
+    if brain.derivation_found_taught_subquestion() != Some(false) {
+        return (None, 0);
+    }
+    // AND THE SAME SWITCH, for the same parity reason: the wired path answers
+    // from this mechanism only when
+    // `relation_transfer_in_answer_path` is set, so the composed entry must
+    // too, or the two disagree and the scorecard measures a route the product
+    // does not run. See that field for the four-scale measurement that makes
+    // OFF the default: +11.1 points of integration at scale 1 bought with
+    // 0.46-0.93 % invention at the larger scales, which PRIORITY ZERO refuses.
+    if !brain.relation_transfer_in_answer_path() {
+        return (None, 0);
+    }
+    derive_by_relation_transfer(brain, query_pool, answer_pool, query, budget)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `align` is the only arithmetic here that can be wrong silently, and the
+    /// subtraction in it underflows on a shared prefix that consumes the
+    /// shorter string unless `max_s` is clamped the way it is.
+    #[test]
+    fn align_finds_the_differing_span_and_does_not_underflow() {
+        assert_eq!(align(b"r001 beside?", b"r000 beside?"), (3, 8));
+        // One string is a prefix of the other: the suffix must be 0, not a
+        // wrapped usize.
+        assert_eq!(align(b"r001", b"r001 beside?"), (4, 0));
+        assert_eq!(align(b"", b"anything"), (0, 0));
+        assert_eq!(align(b"abc", b"xyz"), (0, 0));
+    }
+
+    /// THE ORDER IS THE COST, so it is asserted rather than described -- and
+    /// WHICH CANDIDATE PATH SUPPLIES THE ANSWER is asserted with it, because
+    /// getting that backwards is what the first version of this test did.
+    ///
+    /// The aligned substitution goes first and is the WRONG SUBJECT here: the
+    /// subject byte and the relation are adjacent, so `T`'s differing span
+    /// carries both and the alignment cannot cut between them. The tail transfer
+    /// is what preserves the subject, and the `|a - i|` ordering is what makes
+    /// it affordable.
+    #[test]
+    fn the_wanted_rewrite_comes_from_the_tail_transfer_and_arrives_inside_the_budget() {
+        let candidates = candidate_rewrites(b"r001 beside?", b"r000 next?");
+        assert_eq!(
+            candidates.first().map(|c| String::from_utf8_lossy(c).to_string()),
+            Some("r000 next?".to_string()),
+            "the aligned substitution is first, and on adjacent differences it borrows the wrong subject"
+        );
+        let position = candidates
+            .iter()
+            .position(|c| c.as_slice() == b"r001 next?")
+            .expect("the wanted rewrite is among the candidates");
+        println!(
+            "aligned candidate {:?}; wanted rewrite at {position} of {}",
+            String::from_utf8_lossy(&candidates[0]),
+            candidates.len()
+        );
+        // 32 is the scorecard's probe budget, and two probes are already spent
+        // before the first rewrite is asked, so the reachable window is 30.
+        assert!(
+            position < 30,
+            "the wanted rewrite must land inside the 32-probe budget, got position {position}"
+        );
+        // AND IT MUST BEAT THE EXHAUSTIVE SPAN SEARCH. If the ordering ever
+        // regresses to length-first the position moves into the hundreds, which
+        // is the 50.0-probes-per-derivation reading the ordering replaced.
+        assert!(
+            position < 16,
+            "the |a - i| ordering is the mechanism's whole cost argument: {position}"
+        );
+    }
+
+    /// THE ACCEPT CONDITION, asserted on the pair the module's own header
+    /// names: the aligned substitution and the tail transfer differ by exactly
+    /// one byte and that byte is the subject's.
+    #[test]
+    fn the_accept_condition_separates_the_tail_transfer_from_the_aligned_one() {
+        let (q, t) = (b"r001 beside?".as_slice(), b"r000 next?".as_slice());
+        assert!(
+            preserves_subject(q, t, b"r001 next?"),
+            "the tail transfer keeps the query's own subject byte and must be accepted"
+        );
+        assert!(
+            !preserves_subject(q, t, b"r000 next?"),
+            "the aligned substitution borrows the subject byte and must be refused"
+        );
+        // A rewrite shorter than the first disagreement cannot carry the
+        // subject, so `get` must refuse rather than index out of bounds.
+        assert!(!preserves_subject(q, t, b"r0"));
+        // The query is a prefix of the trained question: no byte of its own is
+        // in dispute.
+        assert!(preserves_subject(b"r001", b"r001 next?", b"r001 next?"));
+    }
+
+    /// THE CLASS MUST BE EXHAUSTIBLE, because the accept rule refuses a
+    /// truncated search and a class that cannot be finished can therefore only
+    /// ever abstain. This is the assertion the removed span-over-span class
+    /// fails: 4,395 candidates for the one-hop pair below and 216,225 for the
+    /// three-hop pair, against the `1 + |q| |T|` this now bounds them to.
+    ///
+    /// Both halves matter. The first is the VERDICT -- `beside_next` read 0/6 at
+    /// scale 1 on the wired path with the old class, where the same mechanism
+    /// read 6/6 before `!truncated` existed. The second is the RAM: the vector
+    /// is built eagerly, so its length is an allocation, and the three-hop count
+    /// is the measured near-constant +8 MB `peak_mb` adder.
+    #[test]
+    fn the_candidate_class_is_bounded_by_the_two_questions_and_can_be_exhausted() {
+        let (q, t) = (b"r001 beside?".as_slice(), b"r000 next?".as_slice());
+        let one_hop = candidate_rewrites(q, t);
+        println!("one-hop candidates {} (bound {})", one_hop.len(), 1 + q.len() * t.len());
+        assert!(
+            one_hop.len() <= 1 + q.len() * t.len(),
+            "the class must be the aligned substitution plus the tail transfers and nothing \
+             else; got {} against {}",
+            one_hop.len(),
+            1 + q.len() * t.len()
+        );
+        // A three-hop question is where the old class exploded, and it is the
+        // one the RAM measurement was taken on.
+        let (q3, t3) = (
+            b"r000 next lamp on material?".as_slice(),
+            b"r001 desk material?".as_slice(),
+        );
+        let three_hop = candidate_rewrites(q3, t3);
+        println!("three-hop candidates {} (bound {})", three_hop.len(), 1 + q3.len() * t3.len());
+        assert!(
+            three_hop.len() <= 1 + q3.len() * t3.len(),
+            "a longer question may cost linearly more candidates and not quadratically more; \
+             got {} against {}",
+            three_hop.len(),
+            1 + q3.len() * t3.len()
+        );
+    }
+
+    /// A candidate equal to the query itself buys nothing and costs a probe.
+    #[test]
+    fn no_candidate_is_the_query_itself_or_empty() {
+        for c in candidate_rewrites(b"r001 beside?", b"r000 next?") {
+            assert_ne!(c.as_slice(), b"r001 beside?", "re-asking the query is not a rewrite");
+            assert!(!c.is_empty(), "an empty rewrite cannot be asked");
+        }
+    }
+}

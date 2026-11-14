@@ -1,0 +1,894 @@
+//! Single-file, random-access Wizard brain container.
+//!
+//! A `.wbrain` file is not a serialized `Brain`. Neuron bodies are separate
+//! records and startup reads only a fixed header plus a compact routing
+//! manifest. Two alternating header slots publish manifests crash-safely.
+
+use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use crate::neuron::{Neuron, NeuronId, NeuronRef, PoolId, Terminal};
+
+const HEADER_BYTES: u64 = 4096;
+const MAGIC: &[u8; 8] = b"W1ZBRAIN";
+const VERSION: u32 = 4;
+const SLOT_BYTES: u64 = 64;
+const SLOT_A: u64 = 16;
+const SLOT_B: u64 = SLOT_A + SLOT_BYTES;
+const NEURON_RECORD: &[u8; 8] = b"W1ZNEUR1";
+/// A neuron body expressed as terminals APPENDED to an earlier record.
+///
+/// `append_record` writes a whole body on every eviction, and on this host the
+/// hot neurons are single-byte atoms carrying ~4.14 M terminals each: one
+/// eviction appends ~82 MB to record a few KB of new connections. Measured
+/// burn 167.96 GB/h over 120 samples, and stopping the training worker took
+/// the volume to -0.0 GB/h, so this path is the writer.
+///
+/// The record is `marker | pool | id | base_offset | len | payload`, where the
+/// payload holds only the terminals added since `base_offset`'s body. A reader
+/// follows `base_offset` to the base and applies the chain in order.
+///
+/// This helps the 41.5 % of the burn that is append-shaped and NOTHING of the
+/// 58.5 % that is perturbed -- a hub atom fires every tick, so every terminal
+/// it owns has its `last_fired_tick` rewritten, measured 20,000 of 20,000.
+/// See `docs/WBRAIN_DELTA_TERMINALS.md`.
+const NEURON_DELTA_RECORD: &[u8; 8] = b"W1ZNDLT1";
+
+/// Deltas a read will follow before the writer is required to re-base with a
+/// full body. A chain is a read amplification, so it is bounded rather than
+/// trusted to stay short.
+pub(crate) const MAX_DELTA_CHAIN: usize = 32;
+const MANIFEST_RECORD: &[u8; 8] = b"W1ZMANI1";
+const AUXILIARY_RECORD: &[u8; 8] = b"W1ZAUX01";
+
+/// Routing-only projection of a neuron record. Maintenance paths use this to
+/// inspect identity and members without reading or deserializing the terminal
+/// payload, which can be orders of magnitude larger than the shape itself.
+pub(crate) struct NeuronShapeRecord {
+    pub pool: PoolId,
+    pub id: NeuronId,
+    pub label: String,
+    pub members: Vec<NeuronRef>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuxiliaryRecordRef {
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Compact state allowed to remain resident while neuron bodies sleep.
+/// Opaque metadata lets the brain layer persist topology and pool routing
+/// structures without coupling the container to those implementations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrainContainerManifest {
+    pub generation: u64,
+    pub tick: u64,
+    pub brain_metadata: Vec<u8>,
+    pub pools: Vec<PoolContainerManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PoolContainerManifest {
+    pub pool_id: PoolId,
+    pub neuron_count: u32,
+    /// Allocated entries in the paged slot table. `neuron_count` remains the
+    /// logical dense ID extent; spare entries permit live neurogenesis.
+    pub neuron_capacity: u32,
+    /// Version-2 fixed-width address/identity table. Large brains keep this
+    /// record on disk and read one 24-byte slot at a time.
+    pub neuron_slot_table: Option<AuxiliaryRecordRef>,
+    /// Version-3 immutable hash index for labels learned before this
+    /// container generation. Runtime-created labels remain as the small
+    /// overlay below until the next compaction.
+    pub label_indexes: Vec<AuxiliaryRecordRef>,
+    /// Version-2 keeps this only for small/in-memory stores. Streaming
+    /// migration publishes an empty vector and uses `neuron_slot_table`.
+    pub neuron_offsets: Vec<Option<u64>>,
+    pub labels: Vec<(String, NeuronId)>,
+    pub pool_metadata: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct HeaderSlot {
+    generation: u64,
+    offset: u64,
+    len: u64,
+    digest: [u8; 32],
+}
+
+pub struct BrainContainer {
+    path: PathBuf,
+    file: File,
+    manifest: Option<BrainContainerManifest>,
+}
+
+impl BrainContainer {
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+        if file.metadata()?.len() < HEADER_BYTES {
+            Self::initialize(&mut file)?;
+        }
+        Self::validate_header(&mut file)?;
+        let a = Self::read_slot(&mut file, SLOT_A)?;
+        let b = Self::read_slot(&mut file, SLOT_B)?;
+        let manifest = [a, b]
+            .into_iter()
+            .flatten()
+            .filter_map(|slot| Self::load_manifest_slot(&mut file, slot).ok())
+            .max_by_key(|manifest| manifest.generation);
+        Ok(Self {
+            path,
+            file,
+            manifest,
+        })
+    }
+
+    fn initialize(file: &mut File) -> io::Result<()> {
+        file.set_len(HEADER_BYTES)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(MAGIC)?;
+        file.write_all(&VERSION.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.sync_all()
+    }
+
+    fn validate_header(file: &mut File) -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 8];
+        let mut version = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        file.read_exact(&mut version)?;
+        if &magic != MAGIC || u32::from_le_bytes(version) != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a supported Wizard brain container",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_slot(file: &mut File, at: u64) -> io::Result<Option<HeaderSlot>> {
+        file.seek(SeekFrom::Start(at))?;
+        let mut raw = [0u8; SLOT_BYTES as usize];
+        file.read_exact(&mut raw)?;
+        let generation = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+        if generation == 0 || offset < HEADER_BYTES || len == 0 {
+            return Ok(None);
+        }
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&raw[24..56]);
+        Ok(Some(HeaderSlot {
+            generation,
+            offset,
+            len,
+            digest,
+        }))
+    }
+
+    fn load_manifest_slot(file: &mut File, slot: HeaderSlot) -> io::Result<BrainContainerManifest> {
+        file.seek(SeekFrom::Start(slot.offset))?;
+        let mut marker = [0u8; 8];
+        let mut len_raw = [0u8; 8];
+        file.read_exact(&mut marker)?;
+        file.read_exact(&mut len_raw)?;
+        let len = u64::from_le_bytes(len_raw);
+        if &marker != MANIFEST_RECORD || len != slot.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest header mismatch",
+            ));
+        }
+        let mut body = vec![
+            0u8;
+            usize::try_from(len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "manifest too large")
+            })?
+        ];
+        file.read_exact(&mut body)?;
+        if *blake3::hash(&body).as_bytes() != slot.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest digest mismatch",
+            ));
+        }
+        let manifest: BrainContainerManifest = bincode::deserialize(&body)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if manifest.generation != slot.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest generation mismatch",
+            ));
+        }
+        Ok(manifest)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn manifest(&self) -> Option<&BrainContainerManifest> {
+        self.manifest.as_ref()
+    }
+
+    pub fn append_neuron(&mut self, pool: PoolId, neuron: &Neuron) -> io::Result<u64> {
+        let body = bincode::serialize(neuron)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        self.append_neuron_body(pool, neuron.id, &body)
+    }
+
+    /// Append an already-serialized body. Callers that must inspect the bytes
+    /// before deciding to write them -- `WbrainNeuronStore::append_record`
+    /// compares them against what is already durable -- would otherwise pay
+    /// bincode twice per eviction, and this path runs on every page-out of a
+    /// brain that evicts everything it owns.
+    pub fn append_neuron_body(
+        &mut self,
+        pool: PoolId,
+        id: NeuronId,
+        body: &[u8],
+    ) -> io::Result<u64> {
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(NEURON_RECORD)?;
+        self.file.write_all(&pool.to_le_bytes())?;
+        self.file.write_all(&id.to_le_bytes())?;
+        self.file.write_all(&(body.len() as u64).to_le_bytes())?;
+        self.file.write_all(body)?;
+        Ok(offset)
+    }
+
+    /// Append terminals to an earlier body instead of rewriting it.
+    ///
+    /// `base_offset` must be the record this neuron's slot currently points
+    /// at. The caller proves the rest -- that nothing outside the terminal
+    /// tail changed, and that the tail only grew -- before choosing this over
+    /// a full body; see `WbrainNeuronStore::append_record`.
+    pub fn append_neuron_delta(
+        &mut self,
+        pool: PoolId,
+        id: NeuronId,
+        base_offset: u64,
+        payload: &[u8],
+    ) -> io::Result<u64> {
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(NEURON_DELTA_RECORD)?;
+        self.file.write_all(&pool.to_le_bytes())?;
+        self.file.write_all(&id.to_le_bytes())?;
+        self.file.write_all(&base_offset.to_le_bytes())?;
+        self.file.write_all(&(payload.len() as u64).to_le_bytes())?;
+        self.file.write_all(payload)?;
+        Ok(offset)
+    }
+
+    /// Read one record header without deciding what kind it is.
+    ///
+    /// Returns `(is_delta, pool, id, base_offset, body_len)`; `base_offset` is
+    /// 0 for a full body.
+    fn read_record_header(
+        &mut self,
+        offset: u64,
+    ) -> io::Result<(bool, PoolId, NeuronId, u64, u64)> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut marker = [0_u8; 8];
+        let mut pool_raw = [0_u8; 4];
+        let mut id_raw = [0_u8; 4];
+        self.file.read_exact(&mut marker)?;
+        self.file.read_exact(&mut pool_raw)?;
+        self.file.read_exact(&mut id_raw)?;
+        let is_delta = &marker == NEURON_DELTA_RECORD;
+        if !is_delta && &marker != NEURON_RECORD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "neuron marker mismatch",
+            ));
+        }
+        let base_offset = if is_delta {
+            let mut raw = [0_u8; 8];
+            self.file.read_exact(&mut raw)?;
+            u64::from_le_bytes(raw)
+        } else {
+            0
+        };
+        let mut len_raw = [0_u8; 8];
+        self.file.read_exact(&mut len_raw)?;
+        Ok((
+            is_delta,
+            PoolId::from_le_bytes(pool_raw),
+            NeuronId::from_le_bytes(id_raw),
+            base_offset,
+            u64::from_le_bytes(len_raw),
+        ))
+    }
+
+    pub fn read_neuron_at(&mut self, offset: u64) -> io::Result<(PoolId, Neuron)> {
+        // Walk any delta chain back to its full body FIRST, collecting the
+        // appended-terminal payloads newest-first, then apply them oldest-first
+        // on top of the base. A full body simply has an empty chain, so the
+        // common path costs one extra header parse and nothing else.
+        let mut chain: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = offset;
+        let mut expected_pool: Option<PoolId> = None;
+        let mut expected_id: Option<NeuronId> = None;
+        loop {
+            let (is_delta, pool, id, base_offset, len) =
+                self.read_record_header(cursor)?;
+            if let Some(previous) = expected_id {
+                if previous != id || expected_pool != Some(pool) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "delta chain crosses neurons",
+                    ));
+                }
+            }
+            expected_pool = Some(pool);
+            expected_id = Some(id);
+            let len = usize::try_from(len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "neuron too large")
+            })?;
+            let mut payload = vec![0_u8; len];
+            self.file.read_exact(&mut payload)?;
+            if !is_delta {
+                let pool = expected_pool.unwrap_or(pool);
+                let mut neuron: Neuron = bincode::deserialize(&payload)
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error)
+                    })?;
+                if Some(neuron.id) != expected_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "neuron id mismatch",
+                    ));
+                }
+                for raw in chain.iter().rev() {
+                    let appended: Vec<Terminal> = bincode::deserialize(raw)
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error)
+                        })?;
+                    neuron.terminals.extend(appended);
+                }
+                neuron.rebuild_terminal_idx();
+                return Ok((pool, neuron));
+            }
+            if chain.len() >= MAX_DELTA_CHAIN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "delta chain exceeds its bound",
+                ));
+            }
+            chain.push(payload);
+            if base_offset == 0 || base_offset >= cursor {
+                // A base must lie EARLIER in an append-only file. Anything else
+                // is corruption or a cycle, and following it would hang a read.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "delta base offset does not precede its delta",
+                ));
+            }
+            cursor = base_offset;
+        }
+    }
+
+    /// Read the bincode prefix through `members` and deliberately leave the
+    /// terminal vector on disk. `Neuron`'s persisted prefix is fixed-width
+    /// bincode data except for the label and member vector; skipped runtime
+    /// fields do not participate in this layout.
+    pub(crate) fn read_neuron_shape_at(&mut self, offset: u64) -> io::Result<NeuronShapeRecord> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut marker = [0_u8; 8];
+        let mut pool_raw = [0_u8; 4];
+        let mut id_raw = [0_u8; 4];
+        let mut len_raw = [0_u8; 8];
+        self.file.read_exact(&mut marker)?;
+        self.file.read_exact(&mut pool_raw)?;
+        self.file.read_exact(&mut id_raw)?;
+        self.file.read_exact(&mut len_raw)?;
+        if &marker != NEURON_RECORD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "neuron marker mismatch",
+            ));
+        }
+        let pool = PoolId::from_le_bytes(pool_raw);
+        let expected_id = NeuronId::from_le_bytes(id_raw);
+        let body_len = u64::from_le_bytes(len_raw);
+        let body_start = self.file.stream_position()?;
+        let body_end = body_start.checked_add(body_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "neuron body extent overflow")
+        })?;
+
+        let read_u32 = |file: &mut File| -> io::Result<u32> {
+            let mut raw = [0_u8; 4];
+            file.read_exact(&mut raw)?;
+            Ok(u32::from_le_bytes(raw))
+        };
+        let read_u64 = |file: &mut File| -> io::Result<u64> {
+            let mut raw = [0_u8; 8];
+            file.read_exact(&mut raw)?;
+            Ok(u64::from_le_bytes(raw))
+        };
+
+        let id = read_u32(&mut self.file)?;
+        if id != expected_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "neuron id mismatch",
+            ));
+        }
+        let label_len = read_u64(&mut self.file)?;
+        let label_end = self
+            .file
+            .stream_position()?
+            .checked_add(label_len)
+            .filter(|end| *end <= body_end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "label outside neuron"))?;
+        let mut label = vec![
+            0_u8;
+            usize::try_from(label_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "neuron label too large")
+            })?
+        ];
+        self.file.read_exact(&mut label)?;
+        debug_assert_eq!(self.file.stream_position()?, label_end);
+        let label = String::from_utf8(label)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+        // NeuronKind is a bincode enum discriminant encoded as u32.
+        let _kind = read_u32(&mut self.file)?;
+        let member_count = read_u64(&mut self.file)?;
+        let member_bytes = member_count
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "member extent overflow"))?;
+        self.file
+            .stream_position()?
+            .checked_add(member_bytes)
+            .filter(|end| *end <= body_end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "members outside neuron"))?;
+        let mut members =
+            Vec::with_capacity(usize::try_from(member_count).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "too many neuron members")
+            })?);
+        for _ in 0..member_count {
+            members.push(NeuronRef {
+                pool: read_u32(&mut self.file)?,
+                neuron: read_u32(&mut self.file)?,
+            });
+        }
+        Ok(NeuronShapeRecord {
+            pool,
+            id,
+            label,
+            members,
+        })
+    }
+
+    pub fn append_auxiliary<F>(
+        &mut self,
+        pool: PoolId,
+        kind: u32,
+        write_body: F,
+    ) -> io::Result<AuxiliaryRecordRef>
+    where
+        F: FnOnce(&mut File) -> io::Result<()>,
+    {
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(AUXILIARY_RECORD)?;
+        self.file.write_all(&pool.to_le_bytes())?;
+        self.file.write_all(&kind.to_le_bytes())?;
+        self.file.write_all(&0_u64.to_le_bytes())?;
+        let body_offset = self.file.stream_position()?;
+        write_body(&mut self.file)?;
+        let end = self.file.stream_position()?;
+        let len = end.checked_sub(body_offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "auxiliary record moved backwards",
+            )
+        })?;
+        self.file.seek(SeekFrom::Start(offset + 16))?;
+        self.file.write_all(&len.to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(end))?;
+        Ok(AuxiliaryRecordRef { offset, len })
+    }
+
+    pub fn read_auxiliary(&mut self, reference: AuxiliaryRecordRef) -> io::Result<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(reference.offset))?;
+        let mut marker = [0_u8; 8];
+        let mut pool = [0_u8; 4];
+        let mut kind = [0_u8; 4];
+        let mut len = [0_u8; 8];
+        self.file.read_exact(&mut marker)?;
+        self.file.read_exact(&mut pool)?;
+        self.file.read_exact(&mut kind)?;
+        self.file.read_exact(&mut len)?;
+        if &marker != AUXILIARY_RECORD || u64::from_le_bytes(len) != reference.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "auxiliary record header mismatch",
+            ));
+        }
+        let mut body = vec![
+            0_u8;
+            usize::try_from(reference.len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "auxiliary record too large")
+            })?
+        ];
+        self.file.read_exact(&mut body)?;
+        Ok(body)
+    }
+
+    /// Read a bounded slice from an auxiliary body without hydrating the
+    /// complete record. `relative_offset` is measured from the body start.
+    pub fn read_auxiliary_exact(
+        &mut self,
+        reference: AuxiliaryRecordRef,
+        relative_offset: u64,
+        body: &mut [u8],
+    ) -> io::Result<()> {
+        let end = relative_offset
+            .checked_add(body.len() as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "auxiliary read overflow")
+            })?;
+        if end > reference.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "auxiliary read exceeds record body",
+            ));
+        }
+        self.file
+            .seek(SeekFrom::Start(reference.offset + 24 + relative_offset))?;
+        self.file.read_exact(body)
+    }
+
+    /// Update a bounded slice of an auxiliary body in place. Auxiliary
+    /// ledgers use this for small counters and bucket roots; neuron records
+    /// remain append-only.
+    pub fn write_auxiliary_exact(
+        &mut self,
+        reference: AuxiliaryRecordRef,
+        relative_offset: u64,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let end = relative_offset
+            .checked_add(body.len() as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "auxiliary write overflow")
+            })?;
+        if end > reference.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "auxiliary write exceeds record body",
+            ));
+        }
+        self.file
+            .seek(SeekFrom::Start(reference.offset + 24 + relative_offset))?;
+        self.file.write_all(body)
+    }
+
+    /// Make a manifest current only after its complete body is durable.
+    pub fn commit_manifest(&mut self, manifest: BrainContainerManifest) -> io::Result<()> {
+        let body = bincode::serialize(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let digest = *blake3::hash(&body).as_bytes();
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(MANIFEST_RECORD)?;
+        self.file.write_all(&(body.len() as u64).to_le_bytes())?;
+        self.file.write_all(&body)?;
+        self.file.sync_data()?;
+
+        let slot_at = if manifest.generation % 2 == 0 {
+            SLOT_A
+        } else {
+            SLOT_B
+        };
+        self.file.seek(SeekFrom::Start(slot_at))?;
+        self.file.write_all(&manifest.generation.to_le_bytes())?;
+        self.file.write_all(&offset.to_le_bytes())?;
+        self.file.write_all(&(body.len() as u64).to_le_bytes())?;
+        self.file.write_all(&digest)?;
+        self.file.write_all(&[0u8; 8])?;
+        self.file.sync_data()?;
+        self.manifest = Some(manifest);
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.sync_all()
+    }
+
+    /// Byte length of every record header: magic, two u32 fields, then a u64
+    /// body length. Neuron and auxiliary records share this shape.
+    pub(crate) const RECORD_HEADER_BYTES: u64 = 24;
+
+    /// Copy one neuron record verbatim into `destination`, returning its new
+    /// offset.
+    ///
+    /// The bincode body is deliberately NOT decoded. Compaction moves bytes,
+    /// so a body this build cannot deserialize still round-trips intact
+    /// instead of being silently re-serialized into whatever the current
+    /// `Neuron` layout happens to be. It also means a compaction pass cannot
+    /// corrupt a field it does not know exists.
+    pub(crate) fn copy_neuron_record_into(
+        &mut self,
+        offset: u64,
+        destination: &mut BrainContainer,
+        buffer: &mut [u8],
+    ) -> io::Result<u64> {
+        // A DELTA MUST BE FOLDED, NEVER COPIED.
+        //
+        // The fast path is a raw byte copy, which is correct for a full body
+        // and wrong for a delta: the copy would carry a `base_offset` pointing
+        // into the SOURCE container, and the compacted file has no record
+        // there. Reading it back would either fail the marker check or follow
+        // an offset that means something else entirely.
+        //
+        // Folding here is also what keeps the format from leaking: a compacted
+        // container holds only full bodies, so a guard clone of it can never
+        // contain a chain, and an older binary can still read it.
+        let (is_delta, ..) = self.read_record_header(offset)?;
+        if !is_delta {
+            return self
+                .copy_record_into(offset, NEURON_RECORD, destination, buffer)
+                .map(|(new_offset, _len)| new_offset);
+        }
+        let (pool, neuron) = self.read_neuron_at(offset)?;
+        let body = bincode::serialize(&neuron)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        destination.append_neuron_body(pool, neuron.id, &body)
+    }
+
+    /// Body length recorded in a record header, without reading the body.
+    pub(crate) fn record_body_len(&mut self, offset: u64) -> io::Result<u64> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; Self::RECORD_HEADER_BYTES as usize];
+        self.file.read_exact(&mut header)?;
+        Ok(u64::from_le_bytes(header[16..24].try_into().unwrap()))
+    }
+
+    /// Pool and kind fields of an auxiliary record header.
+    pub(crate) fn auxiliary_header(
+        &mut self,
+        reference: AuxiliaryRecordRef,
+    ) -> io::Result<(PoolId, u32)> {
+        self.file.seek(SeekFrom::Start(reference.offset))?;
+        let mut header = [0_u8; Self::RECORD_HEADER_BYTES as usize];
+        self.file.read_exact(&mut header)?;
+        if &header[0..8] != AUXILIARY_RECORD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "auxiliary marker mismatch",
+            ));
+        }
+        if u64::from_le_bytes(header[16..24].try_into().unwrap()) != reference.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "auxiliary length mismatch",
+            ));
+        }
+        Ok((
+            u32::from_le_bytes(header[8..12].try_into().unwrap()),
+            u32::from_le_bytes(header[12..16].try_into().unwrap()),
+        ))
+    }
+
+    /// Copy an auxiliary record verbatim, returning its reference in
+    /// `destination`. Suitable only for bodies that are position independent;
+    /// bodies that nest absolute offsets must be rewritten by the caller.
+    pub(crate) fn copy_auxiliary_record_into(
+        &mut self,
+        reference: AuxiliaryRecordRef,
+        destination: &mut BrainContainer,
+        buffer: &mut [u8],
+    ) -> io::Result<AuxiliaryRecordRef> {
+        let (offset, len) =
+            self.copy_record_into(reference.offset, AUXILIARY_RECORD, destination, buffer)?;
+        if len != reference.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "auxiliary body length disagreed with its reference",
+            ));
+        }
+        Ok(AuxiliaryRecordRef { offset, len })
+    }
+
+    /// Read at most `limit` bytes from the start of an auxiliary body. Used to
+    /// classify a record by its magic without hydrating a multi-gigabyte body.
+    pub(crate) fn read_auxiliary_prefix(
+        &mut self,
+        reference: AuxiliaryRecordRef,
+        limit: usize,
+    ) -> io::Result<Vec<u8>> {
+        let take = (reference.len as usize).min(limit);
+        let mut body = vec![0_u8; take];
+        if take > 0 {
+            self.file
+                .seek(SeekFrom::Start(reference.offset + Self::RECORD_HEADER_BYTES))?;
+            self.file.read_exact(&mut body)?;
+        }
+        Ok(body)
+    }
+
+    /// Shared verbatim record copy. Streams the body through `buffer` so a
+    /// record larger than RAM still moves.
+    fn copy_record_into(
+        &mut self,
+        offset: u64,
+        expected_magic: &[u8; 8],
+        destination: &mut BrainContainer,
+        buffer: &mut [u8],
+    ) -> io::Result<(u64, u64)> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; Self::RECORD_HEADER_BYTES as usize];
+        self.file.read_exact(&mut header)?;
+        if &header[0..8] != expected_magic {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record marker mismatch during compaction",
+            ));
+        }
+        let body_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let new_offset = destination.file.seek(SeekFrom::End(0))?;
+        destination.file.write_all(&header)?;
+        let mut remaining = body_len;
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            let slice = &mut buffer[..take];
+            self.file.read_exact(slice)?;
+            destination.file.write_all(slice)?;
+            remaining -= take as u64;
+        }
+        Ok((new_offset, body_len))
+    }
+
+    /// Append an auxiliary record whose body is already materialized.
+    pub(crate) fn append_auxiliary_body(
+        &mut self,
+        pool: PoolId,
+        kind: u32,
+        body: &[u8],
+    ) -> io::Result<AuxiliaryRecordRef> {
+        self.append_auxiliary(pool, kind, |writer| writer.write_all(body))
+    }
+
+    /// Total bytes currently occupied by the container.
+    pub fn byte_len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+}
+
+/// Bytes reserved for the fixed header and its two alternating manifest slots.
+/// A container of exactly this length holds no records.
+pub(crate) fn header_bytes() -> u64 {
+    HEADER_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::neuron::{NeuronKind, Terminal};
+
+    fn tmpfile(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "w1z4rd_{name}_{}_{}.wbrain",
+            std::process::id(),
+            nonce
+        ))
+    }
+
+    fn manifest(generation: u64, offset: u64) -> BrainContainerManifest {
+        BrainContainerManifest {
+            generation,
+            tick: 42,
+            brain_metadata: b"topology".to_vec(),
+            pools: vec![PoolContainerManifest {
+                pool_id: 1,
+                neuron_count: 1,
+                neuron_capacity: 1,
+                neuron_slot_table: None,
+                label_indexes: Vec::new(),
+                neuron_offsets: vec![Some(offset)],
+                labels: vec![("t:YQ".into(), 0)],
+                pool_metadata: b"pool".to_vec(),
+            }],
+        }
+    }
+
+    #[test]
+    fn startup_reads_manifest_then_neuron_on_demand() {
+        let path = tmpfile("lazy");
+        {
+            let mut container = BrainContainer::open(&path).unwrap();
+            let neuron = Neuron::new_atom(0, "t:YQ".into(), NeuronKind::Excitatory, 42);
+            let offset = container.append_neuron(1, &neuron).unwrap();
+            container.commit_manifest(manifest(1, offset)).unwrap();
+        }
+        let mut reopened = BrainContainer::open(&path).unwrap();
+        let routing = reopened.manifest().unwrap();
+        assert_eq!(routing.pools[0].labels[0], ("t:YQ".into(), 0));
+        let offset = routing.pools[0].neuron_offsets[0].unwrap();
+        let (pool, neuron) = reopened.read_neuron_at(offset).unwrap();
+        assert_eq!(pool, 1);
+        assert_eq!(neuron.label, "t:YQ");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn routing_shape_skips_terminal_payload_and_preserves_members() {
+        let path = tmpfile("shape");
+        let members = vec![NeuronRef::new(3, 7), NeuronRef::new(3, 9)];
+        let mut neuron = Neuron::new_concept(
+            4,
+            "concept:shape".into(),
+            NeuronKind::Excitatory,
+            members.clone(),
+            8,
+        );
+        neuron.terminals = (0..10_000)
+            .map(|id| Terminal::new(NeuronRef::new(0, id), 0.5, 8))
+            .collect();
+        let mut container = BrainContainer::open(&path).unwrap();
+        let offset = container.append_neuron(3, &neuron).unwrap();
+        let shape = container.read_neuron_shape_at(offset).unwrap();
+        assert_eq!(shape.pool, 3);
+        assert_eq!(shape.id, 4);
+        assert_eq!(shape.label, "concept:shape");
+        assert_eq!(shape.members, members);
+        let (_, complete) = container.read_neuron_at(offset).unwrap();
+        assert_eq!(complete.terminals.len(), 10_000);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn alternating_slots_select_latest_valid_generation() {
+        let path = tmpfile("generations");
+        {
+            let mut container = BrainContainer::open(&path).unwrap();
+            let neuron = Neuron::new_atom(0, "first".into(), NeuronKind::Excitatory, 1);
+            let offset = container.append_neuron(2, &neuron).unwrap();
+            container.commit_manifest(manifest(1, offset)).unwrap();
+            let mut newer = manifest(2, offset);
+            newer.tick = 99;
+            container.commit_manifest(newer).unwrap();
+        }
+        let reopened = BrainContainer::open(&path).unwrap();
+        assert_eq!(reopened.manifest().unwrap().generation, 2);
+        assert_eq!(reopened.manifest().unwrap().tick, 99);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn auxiliary_record_streams_without_buffering_its_body() {
+        let path = tmpfile("auxiliary");
+        let reference;
+        {
+            let mut container = BrainContainer::open(&path).unwrap();
+            reference = container
+                .append_auxiliary(7, 11, |writer| writer.write_all(b"cold-routing-ledger"))
+                .unwrap();
+            assert_eq!(reference.len, 19);
+        }
+        let mut reopened = BrainContainer::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_auxiliary(reference).unwrap(),
+            b"cold-routing-ledger"
+        );
+        std::fs::remove_file(path).ok();
+    }
+}

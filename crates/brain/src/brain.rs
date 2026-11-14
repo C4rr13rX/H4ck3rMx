@@ -1,0 +1,11554 @@
+//! The top-level Brain struct per [`ARCHITECTURE.md`] §3 and §4.
+//!
+//! Owns a [`Fabric`] of pools and tracks the multi-pool firing history
+//! needed for binding-concept emergence (spec §4.A) and for grounding-
+//! report production at integration time (spec §2 / §4.D).
+//!
+//! Phase 1 supplied the substrate primitives.  This file ties them
+//! together into something you can `create`, `observe` into, and
+//! `integrate` from, with every output carrying a [`GroundingReport`].
+//! That's the answer contract.
+
+#[path = "streaming_migration.rs"]
+mod streaming_migration;
+#[path = "wbrain_metadata.rs"]
+pub(crate) mod wbrain_metadata;
+
+use ahash::AHashMap;
+use std::collections::VecDeque;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
+
+use crate::action::{ActionEvent, ActionId};
+use crate::annealer::{Annealer, AnnealerConfig};
+use crate::eem::{Eem, EemConfig};
+use crate::fabric::{Fabric, FabricConfig};
+use crate::grounding::{AnswerWithGrounding, ConfidenceTier, GroundingReport};
+use crate::identity::{
+    BrainDeploymentSpec, BrainIdentitySpec, FeedbackLoopSpec, IdentityBuildError, PoolKind,
+    PoolPrototypeRegistry,
+};
+use crate::network::{
+    BrainId, GossipEquation, GossipMotif, NetworkState, PeerAccuracy, PeerContribution,
+};
+use crate::neuron::{Neuron, NeuronId, NeuronKind, NeuronRef, PoolId};
+use crate::pool::{AtomEncoding, BytePassthroughEncoding, Pool, PoolConfig};
+
+/// Bytes a hashbrown table of `capacity` usable slots actually allocates.
+///
+/// Every RAM census in this crate had been charging a map `len * size_of`,
+/// which is wrong twice over: a table allocates for its CAPACITY, and
+/// hashbrown holds a control byte per bucket on top of each `(K, V)`. The
+/// bucket count is not the capacity either -- hashbrown keeps one bucket in
+/// eight spare, so `capacity = buckets - buckets / 8`, and inverting that
+/// (`capacity * 8 / 7`, rounded up to a power of two) recovers what was
+/// allocated. Measured at scale 64: 9,728 facts in `lifetime_recurrences`
+/// report 16,384 buckets, not 9,728 slots -- a 68 % undercount per map.
+///
+/// Public because `examples/scorecard.rs` must charge `Neuron::terminal_idx`
+/// by the same rule; two spellings of one allocation is how a residual stays
+/// unnamed.
+pub fn hash_table_bytes<K, V>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = ((capacity * 8) / 7).next_power_of_two().max(4);
+    buckets * (std::mem::size_of::<(K, V)>() + 1)
+}
+
+/// Page concept membership trees back from the cold tier before a decoder
+/// expands them into atom evidence. Eviction deliberately leaves neuron IDs
+/// stable but clears heavy member vectors; treating that placeholder as an
+/// empty concept makes a learned binding disappear after RAM pressure.
+fn ensure_neuron_trees_loaded(pool: &mut Pool, roots: &[NeuronId]) {
+    let mut pending = roots.to_vec();
+    let mut seen = ahash::AHashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if pool.ensure_shape_loaded_read_only(id).is_err() {
+            continue;
+        }
+        let members = pool
+            .get(id)
+            .map(|neuron| neuron.members.clone())
+            .unwrap_or_default();
+        pending.extend(
+            members
+                .into_iter()
+                .filter(|member| member.pool == pool.id())
+                .map(|member| member.neuron),
+        );
+    }
+}
+
+#[derive(Clone)]
+enum BindingPostingKey {
+    Sequence(PoolId, PoolId, Vec<NeuronId>),
+    Feature(PoolId, NeuronId),
+    /// Joint evidence from two independently grounded sparse semantic atoms.
+    /// IDs are stored in ascending order so learning and query lookup share
+    /// one deterministic key regardless of atom activation order.
+    FeaturePair(PoolId, NeuronId, NeuronId),
+    Motif(PoolId, [u8; 3]),
+}
+
+pub(crate) const FINGERPRINT_LIFETIME_KEY: u8 = 16;
+pub(crate) const FINGERPRINT_TENTATIVE_KEY: u8 = 17;
+pub(crate) const FINGERPRINT_PROMOTED_KEY: u8 = 18;
+pub(crate) const FINGERPRINT_TENTATIVE_COUNT_KEY: &[u8] = &[19];
+pub(crate) const FINGERPRINT_PROMOTED_COUNT_KEY: &[u8] = &[20];
+pub(crate) const FINGERPRINT_STATE_MARKER_KEY: &[u8] = &[21];
+const FINGERPRINT_ONLY_GENERATION_KEY: &[u8] = &[22];
+const FINGERPRINT_CANDIDATE_GENERATION_KEY: &[u8] = &[23];
+const FINGERPRINT_HASHED_SCALAR_GENERATION_KEY: &[u8] = &[24];
+
+pub(crate) fn encode_fingerprint_posting_key(
+    kind: u8,
+    pairs: &[(PoolId, NeuronId)],
+    ordered_per_pool: &[(PoolId, Vec<NeuronId>)],
+) -> Vec<u8> {
+    let pair_bytes = pairs.len().saturating_mul(8);
+    let ordered_bytes = ordered_per_pool.iter().fold(0usize, |total, (_, ids)| {
+        total
+            .saturating_add(8)
+            .saturating_add(ids.len().saturating_mul(4))
+    });
+    let mut out = Vec::with_capacity(
+        1usize
+            .saturating_add(4)
+            .saturating_add(pair_bytes)
+            .saturating_add(4)
+            .saturating_add(ordered_bytes),
+    );
+    out.push(kind);
+    out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+    for (pool, neuron) in pairs {
+        out.extend_from_slice(&pool.to_le_bytes());
+        out.extend_from_slice(&neuron.to_le_bytes());
+    }
+    out.extend_from_slice(&(ordered_per_pool.len() as u32).to_le_bytes());
+    for (pool, ids) in ordered_per_pool {
+        out.extend_from_slice(&pool.to_le_bytes());
+        out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn decode_fingerprint_posting_key(key: &[u8], expected_kind: u8) -> Option<MomentFingerprint> {
+    fn take_u32(key: &[u8], at: &mut usize) -> Option<u32> {
+        let end = at.checked_add(4)?;
+        let value = u32::from_le_bytes(key.get(*at..end)?.try_into().ok()?);
+        *at = end;
+        Some(value)
+    }
+
+    if key.first().copied()? != expected_kind {
+        return None;
+    }
+    let mut at = 1usize;
+    let pair_count = usize::try_from(take_u32(key, &mut at)?).ok()?;
+    let mut pairs = Vec::new();
+    pairs.try_reserve_exact(pair_count).ok()?;
+    for _ in 0..pair_count {
+        pairs.push((take_u32(key, &mut at)?, take_u32(key, &mut at)?));
+    }
+    let pool_count = usize::try_from(take_u32(key, &mut at)?).ok()?;
+    let mut ordered_per_pool = Vec::new();
+    ordered_per_pool.try_reserve_exact(pool_count).ok()?;
+    for _ in 0..pool_count {
+        let pool = take_u32(key, &mut at)?;
+        let id_count = usize::try_from(take_u32(key, &mut at)?).ok()?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(id_count).ok()?;
+        for _ in 0..id_count {
+            ids.push(take_u32(key, &mut at)?);
+        }
+        ordered_per_pool.push((pool, ids));
+    }
+    if at != key.len() {
+        return None;
+    }
+    let legacy_pairs = ordered_per_pool.is_empty().then_some(pairs);
+    Some(MomentFingerprint {
+        legacy_pairs,
+        ordered_per_pool,
+        members_extra: Vec::new(),
+    })
+}
+
+/// In-RAM identity of an exact-sequence binding route.
+///
+/// The route's natural key is `(query pool, target pool, atom sequence)`, and
+/// that sequence is already held by `MomentFingerprint::ordered_per_pool` and
+/// by the binding's own members. Keeping a third copy per route cost 1.96 MB
+/// over 9,742 entries at scale 64. Point lookup is the only operation this
+/// index supports — nothing prefix-scans it, on disk or in RAM — so a digest
+/// of the encoded key is a complete substitute for the key.
+type SequenceRouteDigest = [u8; crate::store::posting_index::POSTING_KEY_DIGEST_BYTES];
+
+fn encode_sequence_posting_key(query: PoolId, target: PoolId, sequence: &[NeuronId]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + sequence.len() * 4);
+    out.push(1);
+    out.extend_from_slice(&query.to_le_bytes());
+    out.extend_from_slice(&target.to_le_bytes());
+    out.extend_from_slice(&(sequence.len() as u32).to_le_bytes());
+    for id in sequence {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// The digest a sequence route is keyed and persisted by. It must agree with
+/// what `posting_index::lookup` derives from the same encoded key, or a
+/// flushed generation stops answering the query that wrote it.
+fn sequence_route_digest(
+    query: PoolId,
+    target: PoolId,
+    sequence: &[NeuronId],
+) -> SequenceRouteDigest {
+    let encoded = encode_sequence_posting_key(query, target, sequence);
+    let digest = blake3::hash(&encoded);
+    digest.as_bytes()[..crate::store::posting_index::POSTING_KEY_DIGEST_BYTES]
+        .try_into()
+        .expect("digest prefix is fixed width")
+}
+
+impl BindingPostingKey {
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Sequence(query, target, sequence) => {
+                encode_sequence_posting_key(*query, *target, sequence)
+            }
+            Self::Feature(pool, neuron) => {
+                let mut out = Vec::with_capacity(9);
+                out.push(2);
+                out.extend_from_slice(&pool.to_le_bytes());
+                out.extend_from_slice(&neuron.to_le_bytes());
+                out
+            }
+            Self::FeaturePair(pool, left, right) => {
+                let (left, right) = if left <= right {
+                    (*left, *right)
+                } else {
+                    (*right, *left)
+                };
+                let mut out = Vec::with_capacity(13);
+                out.push(4);
+                out.extend_from_slice(&pool.to_le_bytes());
+                out.extend_from_slice(&left.to_le_bytes());
+                out.extend_from_slice(&right.to_le_bytes());
+                out
+            }
+            Self::Motif(pool, motif) => {
+                let mut out = Vec::with_capacity(8);
+                out.push(3);
+                out.extend_from_slice(&pool.to_le_bytes());
+                out.extend_from_slice(motif);
+                out
+            }
+        }
+    }
+}
+
+/// Which tier of substrate a [`BindingMatch`] succeeded at.  Stage 11
+/// (concept-tier OOV) audits #1, #4 and #8 in the design log: the
+/// tier tag travels alongside precision/recall so the single OOV gate
+/// in `integrate_autonomous` can reason about WHAT kind of match it
+/// passed (or rejected), without re-deriving it from the precision
+/// number alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MatchTier {
+    /// No binding produced any non-zero intersection at either tier.
+    None,
+    /// Match succeeded only at the atom level (raw bytes).  This is
+    /// the Stage 9 baseline behavior.
+    Atom,
+    /// Match succeeded at the concept level (composite neurons that
+    /// emerged via `recent_atoms` co-firing) and passed the coverage
+    /// gate.  This is the Stage 11 add — for multi-character prompts
+    /// like "photosynthesis" once a single concept neuron has emerged
+    /// for the whole word, the binding match jumps from atom-precision
+    /// ~0.4 to concept-precision 1.0.
+    Concept,
+}
+
+/// Result of [`Brain::best_binding_match_v2`].  Carries the
+/// precision/recall pair plus the tier at which the match was found.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingMatch {
+    pub precision: f32,
+    pub recall: f32,
+    pub tier: MatchTier,
+}
+
+/// A recalled action together with the learned neural evidence that selected
+/// it. Keeping this evidence attached prevents downstream callers from
+/// reverse-engineering intent from the decoded bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankedFeatureBinding {
+    pub bytes: Vec<u8>,
+    /// Query feature atoms that co-fired with this action during learning.
+    pub matched_labels: Vec<String>,
+    /// Total feature atoms on the narrowest qualifying learned pathway.
+    pub learned_feature_count: usize,
+    /// Success evidence minus failure evidence across identical actions.
+    pub outcome_score: i32,
+    pub use_count: u64,
+    pub target_size: usize,
+    pub binding_id: NeuronId,
+}
+
+/// Cheap pressure evidence for a sparse composite semantic route. Callers use
+/// this to schedule guarded maintenance before a protected binding disappears
+/// behind the global attention cap; it never pages binding neuron bodies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FeatureRoutePressure {
+    pub composite_keys: usize,
+    pub composite_candidates: usize,
+    pub composite_saturated: bool,
+}
+
+/// Stage 13A — one neuron in a single pool's decoded extrusion.
+#[derive(Debug, Clone)]
+pub struct DecodedConcept {
+    pub neuron: NeuronRef,
+    pub activation: f32,
+    pub label: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Stage 13A — one pool's top-K decoded concepts from a settled state.
+#[derive(Debug, Clone)]
+pub struct PoolExtrusion {
+    pub pool: PoolId,
+    pub decoded: Vec<DecodedConcept>,
+}
+
+/// Stage 13A — full multi-pool extrusion produced by
+/// [`Brain::integrate_resonant`].  This is the substrate-level
+/// support for the "epoxy mould" creation model: one input pattern
+/// fires the constraint into the substrate, settling iterates the
+/// resonance, and `pools` carries the coherent multi-pool state
+/// that satisfied the constraint.
+#[derive(Debug, Clone)]
+pub struct ResonantExtrusion {
+    pub iterations_run: usize,
+    pub converged: bool,
+    pub pools: Vec<PoolExtrusion>,
+}
+
+/// Stage 17.4 full — knobs for `Brain::run_eviction_pass`.  Per
+/// [`ARCHITECTURE.md`] §17.4: low-salience, stale concept neurons get
+/// paged out to cold tier in batches.  Atoms + binding-pool neurons
+/// are never evicted by this policy.
+#[derive(Debug, Clone, Copy)]
+pub struct EvictionParams {
+    /// Evict only concepts whose `salience_ema` is **below** this
+    /// threshold.  Default `0.1` — well below the typical EMA of a
+    /// concept that's been touched by any successful decode.
+    pub max_salience_ema: f32,
+    /// Evict only concepts whose `last_fired_tick` is at least this
+    /// many ticks in the past.  Default `1000`.
+    pub min_stale_ticks: u64,
+    /// Cap evictions per pool per pass.  Default `1024` — bounded so a
+    /// single pass doesn't lock the brain for an arbitrary amount of
+    /// time.  Caller invokes the pass repeatedly to drain large brains.
+    pub target_per_pool: usize,
+}
+
+impl Default for EvictionParams {
+    fn default() -> Self {
+        Self {
+            max_salience_ema: 0.1,
+            min_stale_ticks: 1000,
+            target_per_pool: 1024,
+        }
+    }
+}
+
+/// Stage 17.4 full — outcome of one `run_eviction_pass`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct EvictionStats {
+    pub pools_visited: usize,
+    pub neurons_evicted: usize,
+    pub errors: usize,
+    pub wall_time_ms: u64,
+}
+
+impl BindingMatch {
+    pub const NONE: Self = Self {
+        precision: 0.0,
+        recall: 0.0,
+        tier: MatchTier::None,
+    };
+    /// Composite score used to pick the strongest match across tiers.
+    #[inline]
+    pub fn score(&self) -> f32 {
+        self.precision * self.recall
+    }
+}
+
+/// Sorted (pool, neuron) signature of a single tick's multi-pool
+/// firing.  Used to detect recurring binding patterns: when the same
+/// multi-pool firing-set has been observed `binding_emergence_threshold`
+/// times within the history window, the brain births a binding concept
+/// in the binding pool whose members reference every neuron in the
+/// signature.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MomentFingerprint {
+    /// Sorted (pool, neuron) pairs, and ONLY for a legacy pair-only record.
+    ///
+    /// The signature is the sorted flattening of `ordered_per_pool`, so a
+    /// fingerprint that has its ordered stream was storing every atom id of
+    /// query and answer a second time: 176 of the 549 bytes one costs at
+    /// scale 64 of the scorecard, over 9,728 of them. `pairs()` derives it.
+    ///
+    /// Legacy bincode snapshots persisted the pair signature and no temporal
+    /// order at all, so those records restore with an EMPTY
+    /// `ordered_per_pool` and nothing to derive from. They keep their list
+    /// here, which is also what `force_promote_tentative` tests for when it
+    /// refuses to invent an order for them.
+    legacy_pairs: Option<Vec<(PoolId, NeuronId)>>,
+    /// Original firing order (per-pool sequence).  Preserved
+    /// separately from `pairs` so binding-pool concepts retain the
+    /// temporal order in which atoms fired — which is what
+    /// `decode_concept_members` walks to reconstruct the trained
+    /// answer bytes.  Without this, decoded bindings appear in
+    /// NeuronId-sorted order (e.g. 'animal' decodes as 'aaniml').
+    /// Not part of equality/hash — same atom set in different
+    /// firing orders is still the same binding for emergence
+    /// purposes.
+    ordered_per_pool: Vec<(PoolId, Vec<NeuronId>)>,
+    /// The concepts that were firing when the episode was captured, per pool
+    /// — ONLY those. Full binding membership is the ordered atom stream above
+    /// followed by these, which is what `members_per_pool()` materialises.
+    ///
+    /// This used to be the whole membership, stored as a clone of
+    /// `ordered_per_pool` that enrichment then extended. Measured at scale 64
+    /// of the scorecard, nothing is enriched on the training path, so it was
+    /// a second copy of every atom id of query and answer: ~150 of the 549
+    /// bytes a fingerprint costs. Concept emergence must enrich what a
+    /// binding stores, not change the identity/hash of the sensory episode
+    /// itself, so this is deliberately outside `Hash`/`Eq` as before.
+    members_extra: Vec<(PoolId, Vec<NeuronId>)>,
+}
+
+impl MomentFingerprint {
+    fn from_fabric_moment(fired: &AHashMap<PoolId, Vec<NeuronId>>) -> Option<Self> {
+        let mut pairs: Vec<(PoolId, NeuronId)> = fired
+            .iter()
+            .flat_map(|(&pid, ns)| ns.iter().map(move |&nid| (pid, nid)))
+            .collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        let pools_represented: std::collections::HashSet<PoolId> =
+            pairs.iter().map(|(p, _)| *p).collect();
+        // Binding candidates require ≥2 pools — single-pool firing is
+        // a within-pool concept-emergence concern, not a binding one.
+        if pools_represented.len() < 2 {
+            return None;
+        }
+        // Capture firing order per pool BEFORE we sort `pairs`.
+        let mut ordered_per_pool: Vec<(PoolId, Vec<NeuronId>)> =
+            fired.iter().map(|(&pid, ns)| (pid, ns.clone())).collect();
+        ordered_per_pool.sort_by_key(|(p, _)| *p);
+        Some(Self {
+            legacy_pairs: None,
+            ordered_per_pool,
+            members_extra: Vec::new(),
+        })
+    }
+
+    /// Sorted (pool, neuron) signature. Derived from the ordered stream --
+    /// the two carry the same multiset by construction -- so the byte keys
+    /// this feeds are identical to the ones written before it was derived.
+    fn pairs(&self) -> Vec<(PoolId, NeuronId)> {
+        if let Some(pairs) = self.legacy_pairs.as_ref() {
+            return pairs.clone();
+        }
+        let mut pairs: Vec<(PoolId, NeuronId)> = self
+            .ordered_per_pool
+            .iter()
+            .flat_map(|(pid, ns)| ns.iter().map(move |&nid| (*pid, nid)))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    fn pair_count(&self) -> usize {
+        match self.legacy_pairs.as_ref() {
+            Some(pairs) => pairs.len(),
+            None => self.ordered_per_pool.iter().map(|(_, v)| v.len()).sum(),
+        }
+    }
+
+    /// Full binding membership: the stable ordered atom stream, then whatever
+    /// concepts were firing for that pool. Materialised on demand — it is read
+    /// once per promotion and once per persist, not held per fingerprint.
+    fn members_per_pool(&self) -> Vec<(PoolId, Vec<NeuronId>)> {
+        self.ordered_per_pool
+            .iter()
+            .map(|(pid, ids)| {
+                let extra = self
+                    .members_extra
+                    .iter()
+                    .find(|(p, _)| p == pid)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(&[]);
+                let mut all = Vec::with_capacity(ids.len() + extra.len());
+                all.extend_from_slice(ids);
+                all.extend_from_slice(extra);
+                (*pid, all)
+            })
+            .collect()
+    }
+
+    /// Split a persisted full membership back into the enrichment suffix.
+    /// Older snapshots store the whole list; a pool whose persisted membership
+    /// is not an extension of its ordered stream keeps all of it, so a
+    /// hand-written or migrated record cannot silently lose members.
+    fn extra_from_full(
+        ordered: &[(PoolId, Vec<NeuronId>)],
+        full: Vec<(PoolId, Vec<NeuronId>)>,
+    ) -> Vec<(PoolId, Vec<NeuronId>)> {
+        full.into_iter()
+            .filter_map(|(pid, ids)| {
+                let prefix = ordered
+                    .iter()
+                    .find(|(p, _)| *p == pid)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(&[]);
+                let tail = if ids.starts_with(prefix) {
+                    ids[prefix.len()..].to_vec()
+                } else {
+                    ids
+                };
+                (!tail.is_empty()).then_some((pid, tail))
+            })
+            .collect()
+    }
+}
+
+/// One shared, immutable fingerprint behind every index that keys on it.
+///
+/// `register_fingerprint` used to clone the whole `MomentFingerprint` into
+/// `moment_history`, `binding_recurrences`, `lifetime_recurrences` and
+/// `tentative_promoted` — four copies of the same three `Vec`s per observed
+/// moment. Measured at scale 64 of the scorecard: `lifetime_recurrences`
+/// 5.13 MB over 9,728 entries and `tentative_promoted` 5.13 MB storing the
+/// SAME key a second time. The fingerprint is never mutated after
+/// construction, so the indexes can share one allocation and hold an 8-byte
+/// pointer each. `Arc<T>: Borrow<T>` keeps every `get`/`remove` call site
+/// taking a plain `&MomentFingerprint`.
+type FpKey = std::sync::Arc<MomentFingerprint>;
+
+/// Fixed-width dedup symbol for a binding concept.
+///
+/// `MomentFingerprint`'s `Hash` covers `pairs` and `ordered_per_pool`, which is
+/// the episode's whole identity, so hashing it twice under different salts
+/// gives 128 bits that distinguish exactly what equality distinguishes.
+fn binding_label(fp: &MomentFingerprint) -> String {
+    let mut low = DefaultHasher::new();
+    fp.hash(&mut low);
+    let mut high = DefaultHasher::new();
+    0xa5a5_5a5a_c3c3_3c3cu64.hash(&mut high);
+    fp.hash(&mut high);
+    format!("fp:{:016x}{:016x}", low.finish(), high.finish())
+}
+
+/// The label format written before `binding_label`: the membership spelled out
+/// pair by pair, then an ordered hash. Kept so a brain restored from an older
+/// snapshot still finds the binding it already has.
+fn legacy_binding_label(fp: &MomentFingerprint) -> String {
+    let member_label: String = fp
+        .pairs()
+        .iter()
+        .map(|(p, n)| format!("p{}n{}", p, n))
+        .collect::<Vec<_>>()
+        .join("|");
+    let mut ordered_hasher = DefaultHasher::new();
+    fp.hash(&mut ordered_hasher);
+    format!("{}|ordered:{:016x}", member_label, ordered_hasher.finish())
+}
+
+// A binding is a temporal episode, not merely a bag of fired neurons.
+// `pairs` keeps the canonical set/multiset signature while
+// `ordered_per_pool` distinguishes anagrams and reordered source/code
+// sequences that carry different meaning.
+impl std::cmp::PartialEq for MomentFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.pairs() == other.pairs() && self.ordered_per_pool == other.ordered_per_pool
+    }
+}
+impl std::cmp::Eq for MomentFingerprint {}
+impl std::hash::Hash for MomentFingerprint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pairs().hash(state);
+        self.ordered_per_pool.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BrainConfig {
+    pub fabric: FabricConfig,
+    /// "Consolidated" tier emergence threshold.  How many recurrences
+    /// of the same multi-pool firing fingerprint promote a *full*
+    /// binding — the kind that auto-populates the EEM with a grounded
+    /// fact and gets gossiped to peers.  Defaults to 3.
+    pub binding_emergence_threshold: u32,
+    /// "Tentative" tier emergence threshold.  A lower bar that
+    /// produces a binding neuron in the binding pool *without*
+    /// registering an EEM fact or emitting gossip.  This is what /chat
+    /// retrieval reads — so sparsely-trained pairs become recallable
+    /// after `tentative_emergence_threshold` co-firings instead of
+    /// having to clear the (much higher) consolidated bar.  Defaults
+    /// to 1 — every cross-pool co-firing becomes a tentative binding.
+    ///
+    /// Set to `u32::MAX` to disable the tentative tier (legacy
+    /// single-tier behavior).
+    #[serde(default = "default_tentative_emergence_threshold")]
+    pub tentative_emergence_threshold: u32,
+    /// Sliding window over which fingerprint recurrence is counted.
+    /// Older moments age out so only "recently sustained" co-firings
+    /// produce bindings.
+    pub moment_history_window: usize,
+    /// Minimum precision×recall accepted by single-pool trained-binding
+    /// retrieval. Kept per brain identity so a broad knowledge brain can be
+    /// OOV-strict without imposing that policy on every deployment.
+    #[serde(default = "default_min_atom_score")]
+    pub min_atom_score: f32,
+    /// Pressure-feedback band on the binding density signal
+    /// (`bindings_per_observation`).  When the signal sits below
+    /// `pressure_band_low` for `pressure_observation_grace` consecutive
+    /// observations, the *consolidated* threshold ratchets down by 1
+    /// (floor: 1).  When the signal climbs above `pressure_band_high`,
+    /// the threshold ratchets up by 1 (ceiling: `pressure_threshold_max`).
+    /// Hysteresis prevents oscillation.
+    ///
+    /// Set `pressure_adjust_enabled = false` to lock the threshold at
+    /// its configured value (legacy static behavior).
+    #[serde(default = "default_pressure_band_low")]
+    pub pressure_band_low: f32,
+    #[serde(default = "default_pressure_band_high")]
+    pub pressure_band_high: f32,
+    #[serde(default = "default_pressure_threshold_max")]
+    pub pressure_threshold_max: u32,
+    #[serde(default = "default_pressure_observation_grace")]
+    pub pressure_observation_grace: u64,
+    #[serde(default = "default_pressure_adjust_enabled")]
+    pub pressure_adjust_enabled: bool,
+    /// Per-pool config for the auto-created "binding pool" that hosts
+    /// binding concepts.  Binding pool atoms are never used for sensor
+    /// input — it only holds composite concepts whose members live in
+    /// other pools.
+    pub binding_pool_config: PoolConfig,
+    /// EEM (Environmental Equation Matrix) config.  Spec §4.B.  An
+    /// empty EEM is created on `Brain::new`; the caller seeds it via
+    /// `brain.eem_mut().register_equation(...)`.
+    pub eem: EemConfig,
+    /// Temporal-prediction annealer config.  Spec §4.C.  An empty
+    /// annealer is created on `Brain::new`; the brain automatically
+    /// captures one frame per pool per `advance_tick`.
+    pub annealer: AnnealerConfig,
+}
+
+fn default_tentative_emergence_threshold() -> u32 {
+    1
+}
+fn default_min_atom_score() -> f32 {
+    0.50
+}
+fn default_pressure_band_low() -> f32 {
+    0.001
+}
+fn default_pressure_band_high() -> f32 {
+    0.05
+}
+fn default_pressure_threshold_max() -> u32 {
+    10
+}
+fn default_pressure_observation_grace() -> u64 {
+    256
+}
+fn default_pressure_adjust_enabled() -> bool {
+    true
+}
+
+impl Default for BrainConfig {
+    fn default() -> Self {
+        let mut binding_pool_config = PoolConfig::defaults("binding", 0);
+        // Binding pool doesn't need atom-sequence emergence — it only
+        // hosts cross-pool members.  Disable by setting the threshold
+        // unreachably high.
+        binding_pool_config.concept_emergence_threshold = u32::MAX;
+        Self {
+            fabric: FabricConfig::default(),
+            binding_emergence_threshold: 3,
+            tentative_emergence_threshold: default_tentative_emergence_threshold(),
+            moment_history_window: 64,
+            min_atom_score: default_min_atom_score(),
+            pressure_band_low: default_pressure_band_low(),
+            pressure_band_high: default_pressure_band_high(),
+            pressure_threshold_max: default_pressure_threshold_max(),
+            pressure_observation_grace: default_pressure_observation_grace(),
+            pressure_adjust_enabled: default_pressure_adjust_enabled(),
+            binding_pool_config,
+            eem: EemConfig::default(),
+            annealer: AnnealerConfig::default(),
+        }
+    }
+}
+
+/// Stats surfaced via [`Brain::stats`].
+#[derive(Debug, Clone, Default)]
+pub struct BrainStats {
+    pub tick: u64,
+    pub pool_count: usize,
+    pub total_neurons: usize,
+    pub total_concepts: usize,
+    pub total_binding: usize,
+    /// Terminals currently resident in RAM. This gauge may increase during
+    /// read-only inference when existing cold-tier neurons are demand-paged
+    /// from SSD; it is not, by itself, a neurogenesis counter.
+    pub total_terminals: usize,
+    /// Explicit alias for `total_terminals`, exposed so diagnostics do not
+    /// mistake working-set hydration for structural learning.
+    pub resident_terminals: usize,
+    /// Neurons whose full members/terminals currently live in the cold tier.
+    pub evicted_neurons: usize,
+    /// Bodies written to the `.wbrain` store by eviction.
+    pub page_outs: u64,
+    /// Bodies read back OUT of the `.wbrain` store on demand. The half that
+    /// says whether a question went to disk at all. It was computable only by
+    /// summing `Pool::wbrain_page_ins` over the pools, which is what
+    /// `examples/scorecard.rs` did -- so no test could state the fact the
+    /// 2026-10-01 store run turned up, that `page_ins` equalled `page_outs`
+    /// exactly at all four scales because nothing released a page-in.
+    pub page_ins: u64,
+    /// Evictions that wrote NOTHING because the durable body was already
+    /// byte-identical. Report beside `page_outs`: the ratio is the only direct
+    /// readout of how much of this append-only store's growth is learning and
+    /// how much is eviction churn. Every previous attribution had to be done by
+    /// differencing `df` against a stopwatch on the host.
+    pub clean_skips: u64,
+    pub binding_pool_id: PoolId,
+    pub fingerprints_window: usize,
+    /// Bindings that crossed `tentative_emergence_threshold` but not
+    /// (yet) `binding_emergence_threshold`.  Visible to /chat retrieval;
+    /// invisible to EEM chain exploration.
+    pub tentative_bindings: usize,
+    /// Bindings that crossed `binding_emergence_threshold` and carry
+    /// an EEM grounded fact.
+    pub consolidated_bindings: usize,
+    /// Current effective consolidated threshold (may differ from
+    /// config if pressure-feedback adjusted it).
+    pub current_threshold: u32,
+    /// Total observations (advance_tick calls with non-empty fingerprint)
+    /// since brain construction or last snapshot restore.
+    pub total_observations: u64,
+    /// `(tentative+consolidated)/total_observations` — drives the
+    /// pressure feedback loop.
+    pub binding_pressure: f32,
+}
+
+/// Nanosecond attribution for the cold-tier stages of one direct-pretraining
+/// episode. Values are diagnostic and never participate in learning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PretrainEpisodeProfile {
+    pub frame_lookup_ns: u64,
+    pub frame_atomize_ns: u64,
+    pub frame_ensure_atoms_ns: u64,
+    pub frame_touch_atoms_ns: u64,
+    pub frame_concept_lookup_ns: u64,
+    pub frame_sequence_recurrence_ns: u64,
+    pub frame_concept_write_ns: u64,
+    pub fingerprint_ns: u64,
+    pub recurrence_ns: u64,
+    pub binding_lookup_ns: u64,
+    pub binding_write_ns: u64,
+    pub advance_tick_ns: u64,
+}
+
+/// One captured prompt→response moment, used by the self-test loop to
+/// score recall without any externally-supplied evaluation set.  The
+/// brain auto-captures these whenever a frame is observed in a pool
+/// while another pool has a recent (within 2 ticks) frame — i.e. the
+/// normal "ask in one pool, answer in another" interaction pattern.
+#[derive(Debug, Clone)]
+pub struct QaPair {
+    pub prompt_pool: PoolId,
+    pub prompt: Vec<u8>,
+    pub response_pool: PoolId,
+    pub response: Vec<u8>,
+    pub observed_tick: u64,
+}
+
+/// Bounded ring-buffer of recently observed QA pairs.  The brain uses it
+/// as its self-supervised evaluation set: `Brain::self_test` samples
+/// pairs from this buffer, replays the prompt, and scores how close the
+/// decoded response is to the captured response.  Capacity-bounded so
+/// memory stays finite across long training runs.
+#[derive(Debug)]
+pub struct QaDatabase {
+    pairs: VecDeque<QaPair>,
+    capacity: usize,
+}
+
+impl QaDatabase {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            pairs: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+    pub fn push(&mut self, p: QaPair) {
+        if self.pairs.len() >= self.capacity {
+            self.pairs.pop_front();
+        }
+        self.pairs.push_back(p);
+    }
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &QaPair> {
+        self.pairs.iter()
+    }
+    /// Stride-sample up to `n` pairs spanning the buffer for deterministic
+    /// coverage across recent + historic captures.
+    pub fn sample(&self, n: usize) -> Vec<&QaPair> {
+        if n == 0 || self.pairs.is_empty() {
+            return Vec::new();
+        }
+        if n >= self.pairs.len() {
+            return self.pairs.iter().collect();
+        }
+        let stride = (self.pairs.len() / n).max(1);
+        self.pairs.iter().step_by(stride).take(n).collect()
+    }
+}
+
+/// Self-tuning controller state — Phase D.  Hill-climbs the global
+/// `decay_rate` knob using the self-test mean_byte_match as the
+/// gradient signal.  Direction flips when recall worsens; magnitude
+/// is multiplicative so the brain converges geometrically on a stable
+/// fixpoint without ever being told what "good" decay looks like.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuningState {
+    /// Most recent `self_test` mean_byte_match used as the gradient.
+    pub last_recall: f32,
+    /// Decay rate at the time `last_recall` was sampled.
+    pub last_decay_rate: f32,
+    /// Sign of the next nudge: +1.0 grows decay, -1.0 shrinks it.
+    /// Flips whenever a step yields lower recall than the previous.
+    pub direction: f32,
+    /// Best recall observed since the controller started, and the
+    /// decay rate that produced it.  Surfaces in `/tuning_state` so
+    /// the operator can see the substrate's discovered optimum.
+    pub best_recall: f32,
+    pub best_decay_rate: f32,
+    /// How many retune steps have run.
+    pub steps: u32,
+    /// Condition-keyed memory: under what (concept_count_bucket,
+    /// locked_count_bucket) condition was the best decay rate
+    /// discovered.  The next retune at a similar condition uses this
+    /// as a starting hypothesis rather than re-discovering from
+    /// scratch.  Bucketed (log2 of counts) so similar-scale brains
+    /// share entries.
+    #[serde(serialize_with = "serialize_condition_best")]
+    pub condition_best: std::collections::HashMap<(u8, u8), (f32, f32)>,
+}
+
+fn serialize_condition_best<S>(
+    map: &std::collections::HashMap<(u8, u8), (f32, f32)>,
+    s: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(map.len()))?;
+    for (&(cbucket, lbucket), &(decay, recall)) in map {
+        seq.serialize_element(&serde_json::json!({
+            "concept_bucket": cbucket,
+            "locked_bucket":  lbucket,
+            "best_decay":     decay,
+            "best_recall":    recall,
+        }))?;
+    }
+    seq.end()
+}
+
+impl Default for TuningState {
+    fn default() -> Self {
+        Self {
+            last_recall: 0.0,
+            last_decay_rate: 2e-5,
+            direction: -1.0, // shrink first — defaults are usually too aggressive
+            best_recall: 0.0,
+            best_decay_rate: 2e-5,
+            steps: 0,
+            condition_best: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// What a single retune step did.  Reported back via `/retune`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuningReport {
+    pub recall_before: f32,
+    pub recall_after: f32,
+    pub decay_before: f32,
+    pub decay_after: f32,
+    pub direction_after: f32,
+    pub best_recall: f32,
+    pub best_decay_rate: f32,
+    pub concept_bucket: u8,
+    pub locked_bucket: u8,
+}
+
+/// Per-pair recall outcome from a self-test pass.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SelfTestRecall {
+    pub prompt: String,
+    pub expected: String,
+    pub decoded: String,
+    pub byte_match_ratio: f32,
+    pub exact: bool,
+}
+
+/// Aggregate self-test report — what the brain produces when it grades
+/// its own recall against its captured QA buffer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SelfTestReport {
+    pub sampled: usize,
+    pub exact_recall: usize,
+    pub mean_byte_match: f32,
+    pub per_pair: Vec<SelfTestRecall>,
+}
+
+pub struct Brain {
+    fabric: Fabric,
+    config: BrainConfig,
+    /// Open neuron-addressable container for the demand-paged lifecycle.
+    wbrain_file: Option<std::sync::Arc<crate::store::WbrainFile>>,
+    binding_pool_id: PoolId,
+    /// Fingerprint history.  Bounded by `moment_history_window`.
+    moment_history: VecDeque<FpKey>,
+    /// Active-count of each fingerprint within the window.  Decays
+    /// when an old fingerprint scrolls out of `moment_history`.
+    binding_recurrences: AHashMap<FpKey, u32>,
+    /// Lifetime co-firing count per fingerprint — *never* decays.
+    /// Sparsely-trained patterns (round-robin training where the
+    /// same pair recurs far outside `moment_history_window`) never
+    /// accumulate in `binding_recurrences`, so this is the fallback
+    /// signal for promotion under sparse schedules.
+    lifetime_recurrences: AHashMap<FpKey, u32>,
+    /// Overlay entries tolerated before `advance_tick` spills to disk.
+    /// See `flush_overlay_if_oversized`.
+    overlay_flush_entry_limit: usize,
+    overlay_flushes: u64,
+    overlay_flush_errors: u64,
+    /// "Tentative" tier promotion — bindings that have a neuron in
+    /// the binding pool but no EEM fact yet.  Visible to /chat
+    /// retrieval (Stage 7 binding-pool routing reads ALL binding-pool
+    /// concepts regardless of tier).  Invisible to EEM chain
+    /// exploration.  Upgraded to `promoted_fingerprints` when the
+    /// count crosses `binding_emergence_threshold`.
+    tentative_promoted: AHashMap<FpKey, NeuronId>,
+    /// "Consolidated" tier promotion — these have an EEM grounded
+    /// fact and have been gossiped to peers.
+    promoted_fingerprints: AHashMap<FpKey, NeuronId>,
+    /// Persisted tier cardinalities include disk generations plus the live
+    /// overlay. They keep pressure/statistics exact without hydrating every
+    /// historical fingerprint key.
+    tentative_binding_count_total: usize,
+    consolidated_binding_count_total: usize,
+    /// Exact ordered-sequence retrieval index.  Trained prompt lookup used
+    /// to scan every binding and every member on each decode, making latency
+    /// grow linearly with the curriculum.  This derived (non-persisted) index
+    /// narrows exact episodic recall to bindings that contain the observed
+    /// query sequence and requested target pool.  It is rebuilt on restore.
+    ///
+    /// Keyed by [`SequenceRouteDigest`], not by the sequence: the atoms are
+    /// already stored on the fingerprint and on the binding's members, and a
+    /// point-lookup index does not need a third copy of them.
+    binding_sequence_index: AHashMap<SequenceRouteDigest, Vec<NeuronId>>,
+    /// Inverted access from a raw feature atom to bindings containing that
+    /// atom either directly or beneath a collapsed feature concept. Derived
+    /// from the atom substrate and rebuilt on restore.
+    binding_feature_atom_index: AHashMap<(PoolId, NeuronId), Vec<NeuronId>>,
+    /// Pairwise composite routes for sparse semantic sensors. These make
+    /// LANGUAGE+BEHAVIOR addressable before broad single-feature candidates
+    /// consume the bounded global attention window.
+    binding_feature_pair_index:
+        AHashMap<(PoolId, NeuronId, NeuronId), Vec<NeuronId>>,
+    /// Sparse associative access for novel character-stream similarity.
+    /// Motifs remain grounded in raw atom sequences; this only avoids
+    /// reconstructing and comparing every learned binding on every query.
+    /// Common-motif postings are bounded because they carry little
+    /// discriminative information and otherwise grow with corpus size.
+    binding_motif_index: AHashMap<(PoolId, [u8; 3]), Vec<NeuronId>>,
+    /// Immutable historical posting generations. Request-time lookup reads
+    /// only the hash bucket keyed by the current input; live training stays
+    /// in the three small overlays above until the next idle transition.
+    binding_posting_indexes: Vec<crate::store::AuxiliaryRecordRef>,
+    /// Subset of immutable generations that actually contain fingerprint
+    /// scalar state. Keeping these tiny references separate prevents every
+    /// recurrence lookup from probing binding-only indexes. The subset is
+    /// derived from generation markers on restore, so the persisted metadata
+    /// format remains backward compatible.
+    fingerprint_posting_indexes: Vec<crate::store::AuxiliaryRecordRef>,
+    /// Full-key, prefix-enumerable fingerprints that have recurrence state
+    /// but no binding yet. Scalar state uses hashed point lookups; only these
+    /// unresolved candidates retain the full atom-grounded identity needed by
+    /// `force_promote_tentative`.
+    fingerprint_candidate_indexes: Vec<crate::store::AuxiliaryRecordRef>,
+    /// Count of advance_tick calls that produced a non-empty
+    /// fingerprint.  Drives the pressure-feedback loop along with
+    /// `len(tentative_promoted) + len(promoted_fingerprints)`.
+    total_observations: u64,
+    /// Current pressure-adjusted *consolidated* threshold.  Tracks
+    /// `config.binding_emergence_threshold` at construction, then
+    /// drifts under the pressure feedback loop within
+    /// `[1, config.pressure_threshold_max]`.
+    current_threshold: u32,
+    /// Tick of the last pressure-adjust attempt; we only adjust once
+    /// per `config.pressure_observation_grace` observations to avoid
+    /// reacting to single-observation noise.
+    last_pressure_check_obs: u64,
+    /// Phase 7: action layer state.  `None` until the caller
+    /// designates an action pool via `designate_action_pool`.
+    action_pool_id: Option<PoolId>,
+    /// Already-emitted action events waiting on outcome feedback.
+    /// `feed_outcome` looks up the action_id and reinforces (or
+    /// weakens) the source→action_neuron terminals per the outcome
+    /// score.  Bounded by `action_history_max` to keep memory finite.
+    pending_actions: AHashMap<ActionId, ActionEvent>,
+    next_action_id: ActionId,
+    /// Tracks which action ids have already been emitted this tick to
+    /// prevent firing the same action neuron more than once per tick.
+    emitted_this_tick: ahash::AHashSet<NeuronRef>,
+    /// Phase 5: Environmental Equation Matrix.  Owned by the brain so
+    /// integration can consult equations and report their confidence
+    /// alongside the fabric's.  Caller seeds equations directly via
+    /// `eem_mut().register_equation(...)`.
+    eem: Eem,
+    /// Phase 6: Temporal-prediction annealer.  Captures one frame per
+    /// pool per tick; consulted by `integrate_with_prediction`.
+    annealer: Annealer,
+    /// Phase 8: distributed-network state.  Pending outbound motif/
+    /// equation gossip, received peer motifs, peer accuracy track
+    /// record.  Transport (cluster) lives outside this crate; this
+    /// state is the brain-side data model.
+    network: NetworkState,
+    /// Auto-captured prompt→response pairs for self-supervised recall
+    /// scoring.  Phase A of the dynamical-feedback architecture: the
+    /// brain grades itself against pairs it has actually observed
+    /// during training, with no external answer key.
+    qa_db: QaDatabase,
+    /// Most recent frame observed in each pool plus the tick it landed
+    /// on.  Used to recognise the cross-pool prompt→response pattern
+    /// during `observe` so the QA buffer auto-populates.
+    recent_frames: AHashMap<PoolId, (Vec<u8>, u64)>,
+    /// Self-tuning hill-climber state.  The brain feeds `self_test`
+    /// recall back into pool decay_rate via this controller — Phase D.
+    tuning: TuningState,
+    /// Deployment-defined online feedback wiring. This state is rebuilt from
+    /// the deployment spec after restore; delayed events are intentionally
+    /// ephemeral because their source activations are tick-local.
+    feedback_loops: Vec<RuntimeFeedbackLoop>,
+    delayed_feedback: Vec<ScheduledFeedback>,
+    feedback_events_emitted: u64,
+    /// Questions [`Self::integrate_autonomous`] may ask the fabric when the
+    /// trained bindings answered nothing, before giving up.
+    ///
+    /// [`DEFAULT_DERIVATION_PROBE_BUDGET`] by default; `0` disables the
+    /// derivation entirely.
+    ///
+    /// It was 0 — off — for one pass, and that default was a measurement:
+    ///
+    /// | budget | scale-64 peak | baseline | scale-64 wall |
+    /// |--------|---------------|----------|---------------|
+    /// | 0      | 39.5 MB       | 39.2 MB  | 39 s          |
+    /// | 32     | 49.1 MB       | 39.2 MB  | 234 s         |
+    /// | 256    | did not complete (300 s timeout at scales 16 and 64)    |
+    ///
+    /// The +9.6 MB in that middle row was not the cost of asking questions. It
+    /// was [`Fabric::observe`] appending every probe's firing to the current
+    /// learning MOMENT — a `Vec`, no dedup, cleared only on tick close, and
+    /// read by exactly one consumer (`advance_tick`'s fingerprint) that the
+    /// answer path never reaches. `observe_fabric_read_only` now uses
+    /// [`Fabric::observe_without_moment`], so a probe allocates nothing that
+    /// outlives it, and the budget's remaining cost is wall time alone.
+    derivation_probe_budget: usize,
+    /// How many UNTAUGHT rewrites the last substitution walked through. This is
+    /// retained as a diagnostic; relation transfer uses the explicit
+    /// `derivation_found_taught_subquestion` verdict instead.
+    derivation_last_continuations: Option<usize>,
+    /// Whether the latest substitution search found an exact taught
+    /// sub-question. `None` means it could not reach a verdict.
+    derivation_found_taught_subquestion: Option<bool>,
+    /// May [`Self::integrate_autonomous`] answer from
+    /// `relation_transfer`? **Default `true`.**
+    ///
+    /// Three-way relational alignment `(query, base_question, trained)` in
+    /// `crate::relation_transfer` verifies disjoint subject and relation spans
+    /// and requires an exact trained frame. The answer path additionally
+    /// requires a completed negative taught-sub-question verdict before it
+    /// invokes this transfer.
+    relation_transfer_in_answer_path: bool,
+    /// Where the taught sub-question has been found before, as
+    /// `(question length, cut point, tail length kept)`.
+    ///
+    /// The deletion search in [`Self::derive_by_substitution_profiled`] scans
+    /// `k = 1..n` with the tail interleaved, so it costs `~2k` questions to
+    /// find a cut at `k`, and `k` is large: the scorecard's
+    /// `"r000 lamp on material?"` cuts at `k = 12` of `n = 22`, which is 24
+    /// questions of a budget of 32 spent locating a cut the brain has already
+    /// located 1,535 times this scale.
+    ///
+    /// The cut is a property of the question's SHAPE, not of the question, and
+    /// the shape repeats: every `on_material` probe of the same length cuts at
+    /// the same point and keeps a 1-byte tail. So the cuts that worked are
+    /// remembered and tried first, at one question each. Nothing here reads a
+    /// byte or knows what a word is — it is a memory of where rewriting has
+    /// worked, and a miss falls straight through to the same full scan.
+    ///
+    /// # Why it is keyed on the question's LENGTH, and holds the shortest cut
+    ///
+    /// The first version keyed on the offset from the END and accepted any
+    /// remembered offset. That is a cache whose hit can differ from what the
+    /// scan would have returned — the scan takes the SHORTEST `k` that scores
+    /// 1.0, a remembered offset need not be shortest, and a longer cut is a
+    /// different sub-question with a different answer to splice. Measured in
+    /// `tools/gate.py`: scale-1 integration rose 40.7 → 44.4 and scale-16 FELL
+    /// 33.6 → 30.6, all of it `next_color` (90.6 % → 73.8 %, and 49.2 % → 36.7 %
+    /// at scale 64), because at scale 64 the object names differ in length and
+    /// one family's remembered offset lands mid-question in another's.
+    ///
+    /// Keyed on `n` and holding the smallest `k` ever seen at that `n`, a hit
+    /// is the scan's own answer for every question whose cut the cache learned
+    /// at that length, so the cache can change the COST and not the result.
+    /// Two different shapes that happen to share a length can still disagree;
+    /// that is bounded by one wrong-cut probe, and the scan runs after it.
+    ///
+    /// Bounded at [`DERIVATION_CUT_HINTS`], most-recently-useful first, and
+    /// deliberately NOT persisted: it is a cache of the current question
+    /// distribution, and a restored brain re-earns it in one question.
+    derivation_cut_hints: Vec<(usize, usize, usize)>,
+    /// Where the taught sub-question's answer has been spliced in before, as
+    /// `(question length, cut point, splice offset)`.
+    ///
+    /// [`Self::derivation_cut_hints`] made LOCATING the taught sub-question
+    /// one question instead of `~2k`. It left the other half of the search
+    /// untouched: once the cut `k` is known the answer still has to be tried
+    /// at every `j` in `0..=k`, which at the scorecard's `k = 12` is 13 more
+    /// questions of a budget of 32 — so a 2-hop derivation cost ~16 and a
+    /// 3-hop one could not fit at all.
+    ///
+    /// The splice point is a property of the same SHAPE the cut is, and it
+    /// repeats for the same reason, so it is remembered the same way: keyed
+    /// on `(n, k)`, bounded at [`DERIVATION_SPLICE_HINTS`], and not persisted.
+    ///
+    /// It holds the SET of `j` that reached the ceiling, not the first one,
+    /// and that is not a refinement — it is what makes the cache compatible
+    /// with the vote the splice scan now takes. A cache of the first `j`
+    /// replays exactly the rewrite the vote exists to outvote, so it would
+    /// have made Cove's measured `on_material` 6/24 -> 18/24 unreachable on
+    /// every repeat of a shape. A replay that produces no ceiling falls
+    /// through to the full scan, so a stale hint costs its own probes and
+    /// changes no answer.
+    derivation_splice_hints: Vec<(usize, usize, Vec<usize>)>,
+    trained_episode_bindings: ahash::AHashMap<u64, NeuronId>,
+    /// What the derivation has SPENT, cumulative over this brain's life.
+    derivation_stats: DerivationStats,
+    /// Posting-cap saturation, per key kind. See [`PostingCapCounters`].
+    posting_caps: PostingCapCounters,
+}
+
+/// What [`Brain::derive_by_substitution_profiled`] cost, cumulative.
+///
+/// # Why a counter and not a formula
+///
+/// The cost per derived answer is the number that decides whether this
+/// mechanism can run on an answer path at corpus scale, and it has been
+/// quoted from three different formulas in this file (`n(n+1)/2`, `~2k`,
+/// `k + (k+1)`) each of which is right for one regime and wrong for the
+/// others. `derive_by_substitution_profiled` already returns the true count
+/// per call and every caller threw it away: `integrate_autonomous` put it in
+/// a `tracing::debug!` nothing reads and `derived_by_substitution_reply`
+/// never asked for it. So the scorecard published `integration_pct` with no
+/// way to tell a mechanism that ran out of budget from one that ran and found
+/// nothing — the same vacuous-zero trap `derivation_probe_budget` was added
+/// to the row to close one layer up.
+///
+/// `budget_exhausted` is the one that distinguishes them: it counts calls
+/// that hit `probes >= max_probes` with no answer, which is starvation, as
+/// against `attempts - answered - budget_exhausted`, which is the mechanism
+/// honestly declining.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DerivationStats {
+    /// Calls that got past the empty/same-pool/zero-depth guard.
+    pub attempts: usize,
+    /// Calls that returned a non-empty answer.
+    pub answered: usize,
+    /// Questions asked of the fabric, summed over every call.
+    pub probes: usize,
+    /// Calls that spent the whole budget and returned nothing.
+    pub budget_exhausted: usize,
+    /// Rewrites that scored well enough to be accepted and were refused
+    /// because the brain was never TAUGHT them.
+    ///
+    /// This is the invention the score could not see. Read it beside
+    /// `answered`: a large count against a steady `answered` is the mechanism
+    /// declining to guess, which is what `integration_wrong_pct` measures one
+    /// layer up.
+    pub rejected_untaught: usize,
+    /// Questions spent replaying remembered cut shapes, and how many of those
+    /// LOCATED the taught sub-question.
+    ///
+    /// The pair exists because the hit RATE is the one quantity that can
+    /// explain the scale dependence of starvation and nobody had measured it.
+    /// A cut hint costs exactly one question per matching entry and collapses a
+    /// repeat from `k + 1` questions to the size of the hint set, so a hint
+    /// that misses is the difference between ~2 questions and a full deletion
+    /// scan of ~2k. Measured 2026-10-01 off `docs/scorecard-baseline.json`:
+    /// `on_material` pays 5.2 probes per attempt at scale 4 and 26.2 at scale
+    /// 64, on question lengths that are IDENTICAL at every scale (a room is
+    /// `r{r:03}`, four bytes below 1,000 rooms), so the scan's size cannot be
+    /// the cause. Three candidate causes have been refuted with numbers --
+    /// score dilution, length-keyed hint collision, and a `settled` flag set
+    /// without an answer -- each of them blind. Read `cut_hint_hits` against
+    /// `cut_hint_probes` before proposing a fourth.
+    pub cut_hint_probes: usize,
+    pub cut_hint_hits: usize,
+}
+
+impl DerivationStats {
+    /// Questions asked per call, or `None` when nothing was attempted — a
+    /// zero would read as "free" where the truth is "never ran".
+    pub fn probes_per_attempt(&self) -> Option<f64> {
+        (self.attempts > 0).then(|| self.probes as f64 / self.attempts as f64)
+    }
+
+    /// Questions asked per answer DELIVERED, which is the figure a caller
+    /// sizing a budget needs: a declined call still spent probes.
+    pub fn probes_per_answer(&self) -> Option<f64> {
+        (self.answered > 0).then(|| self.probes as f64 / self.answered as f64)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeFeedbackLoop {
+    source_pool: PoolId,
+    target_pool: PoolId,
+    spec: FeedbackLoopSpec,
+    /// Integrates fractional dynamic gain into biologically meaningful
+    /// firing frequency: gain 0.25 produces one feedback spike per four ticks.
+    phase: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledFeedback {
+    due_tick: u64,
+    target_pool: PoolId,
+    frame: Vec<u8>,
+}
+
+/// Cosine similarity between two sparse co-firing signatures.  A
+/// signature is a `NeuronRef -> weight` map representing which OTHER
+/// neurons this concept co-fires with (and how strongly).  Two
+/// concepts are structurally analogous if their co-firing fingerprints
+/// overlap — this is the architecture's "X is like Y" similarity
+/// metric, not label-string matching.
+fn cofiring_cosine(
+    a: &ahash::AHashMap<NeuronRef, f32>,
+    b: &ahash::AHashMap<NeuronRef, f32>,
+) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    for (k, &va) in small {
+        if let Some(&vb) = large.get(k) {
+            dot += va * vb;
+        }
+    }
+    let na: f32 = a.values().map(|v| v * v).sum::<f32>().sqrt();
+    let nb: f32 = b.values().map(|v| v * v).sum::<f32>().sqrt();
+    if na <= 0.0 || nb <= 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Position-weighted byte match between two byte sequences.  1.0 means
+/// identical-length identical-bytes; 0.0 means no positional matches.
+/// Used by `Brain::self_test` to score decoded responses against
+/// captured ground-truth.
+fn byte_match_ratio_local(decoded: &[u8], expected: &[u8]) -> f32 {
+    if decoded.is_empty() && expected.is_empty() {
+        return 1.0;
+    }
+    let len = decoded.len().max(expected.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let mut hits = 0usize;
+    for i in 0..decoded.len().min(expected.len()) {
+        if decoded[i] == expected[i] {
+            hits += 1;
+        }
+    }
+    hits as f32 / len as f32
+}
+
+fn normalized_char_motifs(bytes: &[u8]) -> ahash::AHashSet<[u8; 3]> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut previous_space = true;
+    for byte in bytes.iter().map(|byte| byte.to_ascii_lowercase()) {
+        if byte.is_ascii_alphanumeric() {
+            normalized.push(byte);
+            previous_space = false;
+        } else if !previous_space {
+            normalized.push(b' ');
+            previous_space = true;
+        }
+    }
+    if normalized.last() == Some(&b' ') {
+        normalized.pop();
+    }
+    normalized
+        .windows(3)
+        .map(|window| [window[0], window[1], window[2]])
+        .collect()
+}
+
+#[cfg(test)]
+mod posting_tests {
+    use super::{
+        append_binding_posting, rank_bounded_binding_evidence,
+        recurrence_posting_refresh_due,
+    };
+
+    #[test]
+    fn posting_append_is_constant_time_idempotent_and_bounded() {
+        let mut ids = Vec::new();
+        append_binding_posting(&mut ids, 4, 2);
+        append_binding_posting(&mut ids, 4, 2);
+        append_binding_posting(&mut ids, 5, 2);
+        append_binding_posting(&mut ids, 6, 2);
+        assert_eq!(ids, vec![4, 5]);
+    }
+
+    #[test]
+    fn global_binding_attention_prefers_cofiring_evidence_and_is_bounded() {
+        let mut evidence = ahash::AHashMap::new();
+        for id in 0..700 {
+            *evidence.entry(id).or_insert(0_u16) += 1;
+        }
+        for id in [3, 17, 699] {
+            *evidence.entry(id).or_insert(0_u16) += 3;
+        }
+        let ranked = rank_bounded_binding_evidence(evidence, 512);
+        assert_eq!(ranked.len(), 512);
+        assert!(ranked.starts_with(&[699, 17, 3]));
+    }
+
+    #[test]
+    fn recurrent_bindings_refresh_postings_at_logarithmic_milestones_and_bounded_cadence() {
+        let due: Vec<u64> = (0..=33)
+            .filter(|count| recurrence_posting_refresh_due(*count))
+            .collect();
+        assert_eq!(due, vec![2, 4, 8, 16, 24, 32]);
+        for start in 1..=64 {
+            assert!((start..start + 8).any(recurrence_posting_refresh_due));
+        }
+    }
+}
+
+/// Binding indexes are populated for newly allocated bindings and refreshed at
+/// logarithmic Hebbian recurrence milestones. Preserve consecutive idempotence
+/// without an O(posting-list-length) scan for every insertion.
+fn append_binding_posting(ids: &mut Vec<NeuronId>, binding_id: NeuronId, limit: usize) {
+    if ids.len() < limit && ids.last().copied() != Some(binding_id) {
+        ids.push(binding_id);
+    }
+}
+
+fn recurrence_posting_refresh_due(use_count: u64) -> bool {
+    // Powers of two cheaply preserve early Hebbian strength milestones, but
+    // become arbitrarily far apart for established bindings. A bounded
+    // maintenance pass must be able to make a protected route visible in the
+    // newest immutable posting generation without inspecting its private
+    // use_count. Cap staleness at eight recurrences while retaining the
+    // logarithmic milestones. This only re-advertises the existing binding.
+    use_count >= 2 && (use_count.is_power_of_two() || use_count % 8 == 0)
+}
+
+const MAX_ROUTED_BINDING_CANDIDATES: usize = 512;
+
+/// Live count of posting-list lookups that came back FULL, per key kind.
+///
+/// `FeatureRoutePressure::composite_saturated` reported the same fact for one
+/// key kind, as a boolean, for the duration of one call — so "the cap is
+/// biting" could only ever be inferred from a fact count. These are cumulative
+/// over the brain's life and snapshotted by [`Brain::posting_cap_stats`], which
+/// is what lets a scorecard row state the saturation rate per scale instead of
+/// reasoning about it.
+///
+/// A saturated lookup is not merely a latency signal. The selection inside
+/// [`Brain::bounded_binding_postings_across_generations`] is NEWEST-first, so a
+/// full list means every binding older than the newest `limit` is invisible to
+/// that key — the reach half of a miss, not the ranking half.
+#[derive(Debug, Default)]
+struct PostingCapCounters {
+    sequence: std::sync::atomic::AtomicUsize,
+    sequence_saturated: std::sync::atomic::AtomicUsize,
+    feature: std::sync::atomic::AtomicUsize,
+    feature_saturated: std::sync::atomic::AtomicUsize,
+    composite: std::sync::atomic::AtomicUsize,
+    composite_saturated: std::sync::atomic::AtomicUsize,
+    motif: std::sync::atomic::AtomicUsize,
+    motif_saturated: std::sync::atomic::AtomicUsize,
+}
+
+impl PostingCapCounters {
+    fn record(&self, key: &BindingPostingKey, saturated: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (total, full) = match key {
+            BindingPostingKey::Sequence(..) => (&self.sequence, &self.sequence_saturated),
+            BindingPostingKey::Feature(..) => (&self.feature, &self.feature_saturated),
+            BindingPostingKey::FeaturePair(..) => (&self.composite, &self.composite_saturated),
+            BindingPostingKey::Motif(..) => (&self.motif, &self.motif_saturated),
+        };
+        total.fetch_add(1, Relaxed);
+        if saturated {
+            full.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> PostingCapStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        PostingCapStats {
+            sequence_lookups: self.sequence.load(Relaxed),
+            sequence_saturated: self.sequence_saturated.load(Relaxed),
+            feature_lookups: self.feature.load(Relaxed),
+            feature_saturated: self.feature_saturated.load(Relaxed),
+            composite_lookups: self.composite.load(Relaxed),
+            composite_saturated: self.composite_saturated.load(Relaxed),
+            motif_lookups: self.motif.load(Relaxed),
+            motif_saturated: self.motif_saturated.load(Relaxed),
+        }
+    }
+}
+
+/// Snapshot of [`PostingCapCounters`]. Cumulative; subtract two snapshots to
+/// attribute saturation to one phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PostingCapStats {
+    pub sequence_lookups: usize,
+    pub sequence_saturated: usize,
+    pub feature_lookups: usize,
+    pub feature_saturated: usize,
+    pub composite_lookups: usize,
+    pub composite_saturated: usize,
+    pub motif_lookups: usize,
+    pub motif_saturated: usize,
+}
+
+impl PostingCapStats {
+    pub fn minus(self, before: Self) -> Self {
+        Self {
+            sequence_lookups: self.sequence_lookups - before.sequence_lookups,
+            sequence_saturated: self.sequence_saturated - before.sequence_saturated,
+            feature_lookups: self.feature_lookups - before.feature_lookups,
+            feature_saturated: self.feature_saturated - before.feature_saturated,
+            composite_lookups: self.composite_lookups - before.composite_lookups,
+            composite_saturated: self.composite_saturated - before.composite_saturated,
+            motif_lookups: self.motif_lookups - before.motif_lookups,
+            motif_saturated: self.motif_saturated - before.motif_saturated,
+        }
+    }
+
+    /// Share of all posting lookups that came back full, or `None` when
+    /// nothing was looked up — a zero would read as "the cap never bit" where
+    /// the truth is "no lookup ran".
+    pub fn saturated_fraction(&self) -> Option<f64> {
+        let total = self.sequence_lookups
+            + self.feature_lookups
+            + self.composite_lookups
+            + self.motif_lookups;
+        let full = self.sequence_saturated
+            + self.feature_saturated
+            + self.composite_saturated
+            + self.motif_saturated;
+        (total > 0).then(|| full as f64 / total as f64)
+    }
+}
+
+/// Rarest query motifs consulted when a route has other evidence to fall back
+/// on. A latency bound, not a correctness one.
+const NARROW_MOTIF_POSTING_LIMIT: usize = 8;
+
+/// Rarest query motifs consulted when the route has to carry the decision --
+/// a validator that may reject every closest match, or a last-resort recall
+/// whose only alternative is answering nothing.
+const WIDE_MOTIF_POSTING_LIMIT: usize = 32;
+
+/// Fraction of a decode that is one short block repeated end to end.
+///
+/// This is the actual runaway-emergence signal. Destructive collapse can
+/// produce concepts that decode by tiling a shorter pattern
+/// ("animalanimalanimal", "bodybodybody"), and those need rejecting.
+///
+/// It was previously approximated by two length proxies -- a 24-byte cap and
+/// a unique-byte ratio -- both of which answer "is this a runaway?" by asking
+/// "is this long?". That holds only while every trained answer is a category
+/// word. Measured 2026-08-20 against real source files: a 2,898-byte Python
+/// module scores a unique-byte ratio of 0.020, far under the 0.6 floor, purely
+/// because byte diversity saturates at 256 while length does not. Every real
+/// unit was rejected; the substrate could return nothing longer than 80 bytes.
+///
+/// Periodicity is scale-free: real code scores 0.000 whether it is 300 bytes
+/// or 300 KB, while the runaway tilings above score 0.667-0.992.
+///
+/// Uses the KMP failure function: for a string of length `n` whose longest
+/// proper border is `f`, the smallest candidate period is `n - f`, and the
+/// string is exactly that block tiled when `n % (n - f) == 0`.
+fn tiled_fraction(bytes: &[u8]) -> f32 {
+    let n = bytes.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let mut failure = vec![0_usize; n];
+    let mut k = 0_usize;
+    for index in 1..n {
+        while k > 0 && bytes[index] != bytes[k] {
+            k = failure[k - 1];
+        }
+        if bytes[index] == bytes[k] {
+            k += 1;
+        }
+        failure[index] = k;
+    }
+    let period = n - failure[n - 1];
+    if period < n && n % period == 0 {
+        1.0 - (period as f32 / n as f32)
+    } else {
+        0.0
+    }
+}
+
+/// Reject a decode only when it is mostly one repeated block.
+///
+/// Deliberately length-independent: a correct answer may be a category word or
+/// an entire source tree, and the substrate must not decide between them by
+/// size.
+fn decode_is_runaway_tiling(bytes: &[u8]) -> bool {
+    const TILING_REJECT_FRACTION: f32 = 0.5;
+    tiled_fraction(bytes) >= TILING_REJECT_FRACTION
+}
+
+fn add_binding_evidence(
+    evidence: &mut AHashMap<NeuronId, u16>,
+    ids: impl IntoIterator<Item = NeuronId>,
+) {
+    for id in ids {
+        let score = evidence.entry(id).or_insert(0);
+        *score = score.saturating_add(1);
+    }
+}
+
+/// Rank cheap posting identities before any neuron body is deserialized.
+/// Co-firing across independent query features is stronger routing evidence
+/// than membership in one broad list. Newer ids win only equal-evidence ties;
+/// generation fairness inside each posting list keeps older established
+/// experience eligible for the comparison.
+fn rank_bounded_binding_evidence(
+    evidence: AHashMap<NeuronId, u16>,
+    limit: usize,
+) -> Vec<NeuronId> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut ranked: Vec<_> = evidence.into_iter().collect();
+    let cmp = |(left_id, left_score): &(NeuronId, u16),
+               (right_id, right_score): &(NeuronId, u16)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| right_id.cmp(left_id))
+    };
+    if ranked.len() > limit {
+        ranked.select_nth_unstable_by(limit, cmp);
+        ranked.truncate(limit);
+    }
+    ranked.sort_unstable_by(cmp);
+    ranked.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Overlay entries retained before `advance_tick` spills them to the on-disk
+/// posting index.
+///
+/// Measured on the live brain 2026-09-04: **2,333 bytes per entry** (0.1211 GB
+/// across 55,745 entries), not the ~20 KB first assumed. 250,000 entries
+/// therefore caps the overlay near 0.6 GB -- comfortable on a 15.6 GB no-swap
+/// host, and high enough that spills stay occasional rather than firing every
+/// few minutes as a 20,000 cap did (~47 MB, far tighter than intended).
+///
+/// A spill is not free: it rebuilds the on-disk posting index for every
+/// retained entry, so an over-tight limit trades RAM for steady write
+/// amplification on the training path.
+const DEFAULT_OVERLAY_FLUSH_ENTRY_LIMIT: usize = 250_000;
+
+/// Questions `integrate_autonomous` may ask the fabric when the trained
+/// bindings answered nothing — see [`Brain::derivation_probe_budget`] for what
+/// each setting costs, and why the figure in that table stopped being the
+/// reason to keep this at 0.
+///
+/// 64 because that is the KNEE, measured rather than reasoned, and 32 was
+/// below the floor the search's own shape sets. The deletion scan that finds
+/// the taught sub-question is `k` outer over `1..n` and `t` inner over
+/// `0..=1`, so it costs up to `2(n-1)` questions before the splice search has
+/// asked anything at all -- 52 at `n = 27`, which is the length of the
+/// scorecard's 3-hop questions (`lit_mean` 27.9 against 23.0 and 21.6 for the
+/// 2-hop families). A ceiling of 32 therefore ran out INSIDE the sub-question
+/// search on every long question whose cut was not already cached, which is
+/// why `next_on_material` sat at 113/512 while the two short families sat at
+/// 1534/1536 and 1024/1024 spending 4.1 probes of 32.
+///
+/// Measured 2026-10-01 (Iris, pass 19), scale 64, one binary, the budget set
+/// per run through the scorecard's `--derivation-budget`:
+///
+/// | budget | integration | wrong | recall | on_material | next_on_material | beside_next | probes/attempt | wall | peak |
+/// |--------|-------------|-------|--------|-------------|------------------|-------------|----------------|-------|------|
+/// |     32 |      77.286 |   0.0 |  100.0 |   1534/1536 |          113/512 |       0/384 |          10.09 |  77 s | 39.8 MB |
+/// |     64 |      84.259 |   0.0 |  100.0 |   1536/1536 |          352/512 |       0/384 |          14.88 | 116 s | 39.7 MB |
+/// |    128 |      84.259 |   0.0 |  100.0 |   1536/1536 |          352/512 |       0/384 |          21.49 | 121 s | 40.5 MB |
+///
+/// 64 and 128 agree to the last printed digit, so everything a probe ceiling
+/// can buy is bought at 64, and 128 is 1.4x the probes for no answers and the
+/// only peak in the three that rose. The wall and peak figures are read back
+/// off `tools/capped.py`'s own JSON line for each run, not off the screen.
+/// Budget 64's peak of 39.7 MB against 32's 39.8 MB is the load-bearing one:
+/// the probes are `observe_fabric_read_only` calls on a read-only path, so
+/// they cost wall and not residency, and the +25 % RAM attributed to probes in
+/// the backlog is not reproduced here.
+///
+/// What the rise does NOT buy: `beside_next` stays 0/384 at every budget while
+/// its starvation falls 332 -> 332 -> 121, so it is starving on a search that
+/// cannot win rather than on a search that ran out. It is a 1-hop family and
+/// needs relation transfer, which no ceiling reaches. The 160 `next_on_material`
+/// misses that survive budget 128 are in the `n(n+1)/2` full-span fallback
+/// (378 rewrites at `n = 27`) taken when no cut is found at all.
+///
+/// The old note here said a budget of 256 "did not complete inside the
+/// scorecard's 300 s timeout at scale 16". Scale 64 -- four times that corpus
+/// -- at budget 128 completes in 121 s, so whatever that reading measured, it
+/// is not a reason to stay at 32.
+///
+/// Applied on the restore paths as well as on `new`: a brain reloaded from a
+/// snapshot that answers differently from a fresh one is a worse defect than
+/// either behaviour.
+pub const DEFAULT_DERIVATION_PROBE_BUDGET: usize = 64;
+
+/// How many cut shapes [`Brain::derive_by_substitution`] remembers.
+///
+/// A remembered cut is keyed on the question's length, and an entry whose
+/// length does not match is skipped without asking anything — so a miss costs
+/// zero questions and there is at most ONE hint probe per hop whatever this
+/// is. It therefore buys hit rate almost free, and is sized for the number of
+/// distinct question lengths a world has rather than for a probe budget:
+/// 64 entries is 64 lengths at three `usize` each.
+pub const DERIVATION_CUT_HINTS: usize = 64;
+
+/// How many splice shapes [`Brain::derive_by_substitution`] remembers.
+///
+/// Keyed on `(n, k)` rather than `n` alone, so it needs more room than
+/// [`DERIVATION_CUT_HINTS`]: a world with 64 question lengths and a handful of
+/// cuts at each still fits in 256 entries at three `usize` apiece (6 KB), and
+/// a miss costs zero questions because a non-matching entry is skipped
+/// without asking anything.
+pub const DERIVATION_SPLICE_HINTS: usize = 256;
+
+impl Brain {
+    /// Construct a fresh brain with no sensor pools yet.  The binding
+    /// pool is auto-created at pool_id = `binding_pool_config.id`.
+    /// Sensor pools get created by the caller via `create_pool`.
+    pub fn new(config: BrainConfig) -> Self {
+        let mut fabric = Fabric::new(config.fabric.clone());
+        let binding_pool_id = config.binding_pool_config.id;
+        let binding_pool = Pool::new(
+            config.binding_pool_config.clone(),
+            Box::new(BytePassthroughEncoding { prefix: "bind" }),
+        );
+        fabric.register_pool(binding_pool);
+        let window = config.moment_history_window;
+        let eem = Eem::new(config.eem.clone());
+        let annealer = Annealer::new(config.annealer.clone());
+        let initial_threshold = config.binding_emergence_threshold.max(1);
+        Self {
+            fabric,
+            config,
+            wbrain_file: None,
+            binding_pool_id,
+            moment_history: VecDeque::with_capacity(window),
+            binding_recurrences: AHashMap::new(),
+            lifetime_recurrences: AHashMap::new(),
+            overlay_flush_entry_limit: DEFAULT_OVERLAY_FLUSH_ENTRY_LIMIT,
+            overlay_flushes: 0,
+            overlay_flush_errors: 0,
+            tentative_promoted: AHashMap::new(),
+            promoted_fingerprints: AHashMap::new(),
+            tentative_binding_count_total: 0,
+            consolidated_binding_count_total: 0,
+            binding_sequence_index: AHashMap::new(),
+            binding_feature_atom_index: AHashMap::new(),
+            binding_feature_pair_index: AHashMap::new(),
+            binding_motif_index: AHashMap::new(),
+            binding_posting_indexes: Vec::new(),
+            fingerprint_posting_indexes: Vec::new(),
+            fingerprint_candidate_indexes: Vec::new(),
+            total_observations: 0,
+            current_threshold: initial_threshold,
+            last_pressure_check_obs: 0,
+            action_pool_id: None,
+            pending_actions: AHashMap::new(),
+            next_action_id: 1,
+            emitted_this_tick: ahash::AHashSet::new(),
+            eem,
+            annealer,
+            network: NetworkState::new(""),
+            qa_db: QaDatabase::new(4096),
+            recent_frames: AHashMap::new(),
+            tuning: TuningState::default(),
+            feedback_loops: Vec::new(),
+            delayed_feedback: Vec::new(),
+            feedback_events_emitted: 0,
+            derivation_probe_budget: DEFAULT_DERIVATION_PROBE_BUDGET,
+            derivation_last_continuations: None,
+            derivation_found_taught_subquestion: None,
+            relation_transfer_in_answer_path: true,
+            derivation_cut_hints: Vec::new(),
+            derivation_splice_hints: Vec::new(),
+            trained_episode_bindings: ahash::AHashMap::new(),
+            derivation_stats: DerivationStats::default(),
+            posting_caps: PostingCapCounters::default(),
+        }
+    }
+
+    /// Resolve and install deployment feedback wiring for this brain.
+    pub fn configure_feedback_loops(
+        &mut self,
+        identity: &BrainIdentitySpec,
+        deployment: &BrainDeploymentSpec,
+    ) -> Result<(), crate::identity::DeploymentValidationError> {
+        deployment.validate(identity)?;
+        let ids: std::collections::HashMap<&str, PoolId> = identity
+            .pools
+            .iter()
+            .map(|pool| (pool.name.as_str(), pool.id))
+            .collect();
+        self.feedback_loops = deployment
+            .feedback_loops
+            .iter()
+            .map(|spec| RuntimeFeedbackLoop {
+                source_pool: ids[spec.source_pool.as_str()],
+                target_pool: ids[spec.target_pool.as_str()],
+                spec: spec.clone(),
+                phase: 0.0,
+            })
+            .collect();
+        self.delayed_feedback.clear();
+        Ok(())
+    }
+
+    pub fn feedback_loop_count(&self) -> usize {
+        self.feedback_loops.len()
+    }
+    pub fn feedback_events_emitted(&self) -> u64 {
+        self.feedback_events_emitted
+    }
+
+    /// Read-only access to the auto-captured QA buffer.
+    pub fn qa_db(&self) -> &QaDatabase {
+        &self.qa_db
+    }
+
+    /// Read-only access to the self-tuning controller state.
+    pub fn tuning_state(&self) -> &TuningState {
+        &self.tuning
+    }
+
+    /// One self-tuning step: run a self_test, hill-climb on decay_rate
+    /// using the recall delta as the gradient signal.  Stores the
+    /// best-seen (decay_rate, recall) pair indexed by current condition
+    /// (concept_count_bucket, locked_count_bucket) so future runs in
+    /// the same substrate regime warm-start from known-good values.
+    ///
+    /// No setpoint — the brain discovers its own decay optimum.
+    pub fn retune(&mut self, sample_count: usize) -> TuningReport {
+        let decay_before = self.tuning.last_decay_rate;
+        let report = self.self_test(sample_count);
+        let recall_now = report.mean_byte_match;
+        let recall_before = self.tuning.last_recall;
+
+        // Update best-ever recall first — we want to capture the
+        // optimum even if the next nudge regresses.
+        if recall_now > self.tuning.best_recall {
+            self.tuning.best_recall = recall_now;
+            self.tuning.best_decay_rate = decay_before;
+        }
+
+        // Bucket the current condition for the condition→value memory.
+        // log2 floors give a coarse grid that handles brains spanning
+        // many orders of magnitude in size.
+        let total_concepts: usize = self
+            .fabric
+            .pool_ids()
+            .into_iter()
+            .filter_map(|pid| self.fabric.pool(pid))
+            .map(|p| {
+                let r = p.read();
+                r.concept_count()
+            })
+            .sum();
+        let locked = self.locked_terminal_count();
+        let cbucket = (total_concepts as f64).max(1.0).log2().floor() as u8;
+        let lbucket = (locked as f64).max(1.0).log2().floor() as u8;
+        let cond = (cbucket, lbucket);
+
+        // Remember the best decay we've seen at this condition.
+        let cond_entry = self
+            .tuning
+            .condition_best
+            .entry(cond)
+            .or_insert((decay_before, recall_now));
+        if recall_now > cond_entry.1 {
+            *cond_entry = (decay_before, recall_now);
+        }
+
+        // Hill-climb step: if recall improved, keep direction; if it
+        // worsened, reverse.
+        if self.tuning.steps > 0 {
+            if recall_now < recall_before {
+                self.tuning.direction *= -1.0;
+            }
+        }
+
+        // Step magnitude scales with the recall signal — strong
+        // gradient → big step, no signal → tiny step.  This stops the
+        // controller from drifting unboundedly when recall plateaus
+        // (e.g. when the consolidation lock has saturated and decay
+        // genuinely doesn't matter any more).
+        let delta_mag = (recall_now - recall_before).abs();
+        let step_pct = (0.01 + delta_mag * 0.5).clamp(0.005, 0.2);
+        let step_factor = 1.0 + step_pct * self.tuning.direction;
+        let mut decay_after = (decay_before * step_factor).clamp(1e-7, 0.01);
+
+        // Condition-memory bias: if we've seen a better decay at this
+        // condition before, blend toward it (20%).  Gives the brain a
+        // long-horizon attractor toward the best-known config for its
+        // current scale.
+        if let Some(&(known_decay, known_recall)) = self.tuning.condition_best.get(&cond) {
+            if known_recall > recall_now {
+                decay_after = decay_after * 0.8 + known_decay * 0.2;
+            }
+        }
+
+        // Apply to every pool's decay_rate.
+        for pid in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pid) {
+                let mut pw = pool.write();
+                pw.config.decay_rate = decay_after;
+            }
+        }
+
+        self.tuning.last_decay_rate = decay_after;
+        self.tuning.last_recall = recall_now;
+        self.tuning.steps += 1;
+
+        TuningReport {
+            recall_before,
+            recall_after: recall_now,
+            decay_before,
+            decay_after,
+            direction_after: self.tuning.direction,
+            best_recall: self.tuning.best_recall,
+            best_decay_rate: self.tuning.best_decay_rate,
+            concept_bucket: cond.0,
+            locked_bucket: cond.1,
+        }
+    }
+
+    /// Total locked-terminal count across every pool.  These terminals
+    /// are decay-exempt by the consolidation lock and form the brain's
+    /// permanent recall floor.
+    pub fn locked_terminal_count(&self) -> usize {
+        self.fabric
+            .pool_ids()
+            .into_iter()
+            .filter_map(|pid| self.fabric.pool(pid))
+            .map(|pool| {
+                let p = pool.read();
+                p.iter_neurons()
+                    .map(|n| n.locked_terminal_count())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Chain integration — feed the integrate() answer back as a new
+    /// query, looping until the answer stops changing or `max_hops` is
+    /// reached.  Tests "answers that exist through the integration of
+    /// training" when A→B and B→C are trained but A→C never was.
+    ///
+    /// Returns the chain of (query_bytes, answer_bytes) pairs in
+    /// order so the caller can audit each hop's contribution.  The
+    /// final tuple's answer is the integrated result.
+    pub fn integrate_chain(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        seed: &[u8],
+        max_hops: usize,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let mut trail: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(max_hops);
+        let mut current: Vec<u8> = seed.to_vec();
+        let mut seen: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
+        for _ in 0..max_hops {
+            if !seen.insert(current.clone()) {
+                // Already visited — converged onto a cycle.
+                break;
+            }
+            // Fire the current query into query_pool, then feed it
+            // ALSO into target_pool so the next hop can read it as a
+            // "B is the new query" context.  The architecture is
+            // pool-agnostic about chain direction: integrating from
+            // query→target with current bytes injected into both pools
+            // makes the next-hop binding match light up if it exists.
+            self.fabric.observe(query_pool, &current);
+            let ans = self.integrate(query_pool, target_pool);
+            let decoded = ans.answer.clone();
+            trail.push((current.clone(), decoded.clone()));
+            match decoded {
+                Some(bytes) if !bytes.is_empty() && bytes != current => {
+                    current = bytes;
+                }
+                _ => break, // null answer or fixpoint → stop chain
+            }
+        }
+        trail
+    }
+
+    /// Run a self-supervised recall test: sample QA pairs from the
+    /// auto-captured buffer, fire each prompt into its prompt pool,
+    /// integrate into the response pool, and score the decoded answer
+    /// against the captured response.  No external evaluation set
+    /// required.
+    ///
+    /// Brain state is barely perturbed (one extra co-firing per probe
+    /// at lr × cross_domain_scale for cross-pool atoms).  The
+    /// consolidation lock prevents trained terminals from drifting.
+    /// This is the brain's own dynamical-feedback signal: a falling
+    /// `mean_byte_match` is the trigger Phase B will hook into to
+    /// retune decay / emergence params.
+    pub fn self_test(&mut self, sample_count: usize) -> SelfTestReport {
+        let pairs: Vec<QaPair> = self
+            .qa_db
+            .sample(sample_count)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut report = SelfTestReport {
+            sampled: 0,
+            exact_recall: 0,
+            mean_byte_match: 0.0,
+            per_pair: Vec::with_capacity(pairs.len()),
+        };
+        if pairs.is_empty() {
+            return report;
+        }
+        let mut byte_sum = 0.0f32;
+        for qp in &pairs {
+            self.fabric.observe(qp.prompt_pool, &qp.prompt);
+            let ans = self.integrate(qp.prompt_pool, qp.response_pool);
+            let decoded = ans.answer.clone().unwrap_or_default();
+            let bm = byte_match_ratio_local(&decoded, &qp.response);
+            let exact = decoded == qp.response;
+            byte_sum += bm;
+            if exact {
+                report.exact_recall += 1;
+            }
+            report.per_pair.push(SelfTestRecall {
+                prompt: String::from_utf8_lossy(&qp.prompt).to_string(),
+                expected: String::from_utf8_lossy(&qp.response).to_string(),
+                decoded: String::from_utf8_lossy(&decoded).to_string(),
+                byte_match_ratio: bm,
+                exact,
+            });
+        }
+        report.sampled = pairs.len();
+        report.mean_byte_match = byte_sum / (pairs.len() as f32);
+        report
+    }
+
+    pub fn eem(&self) -> &Eem {
+        &self.eem
+    }
+    pub fn eem_mut(&mut self) -> &mut Eem {
+        &mut self.eem
+    }
+    pub fn annealer(&self) -> &Annealer {
+        &self.annealer
+    }
+    pub fn annealer_mut(&mut self) -> &mut Annealer {
+        &mut self.annealer
+    }
+
+    pub fn fabric(&self) -> &Fabric {
+        &self.fabric
+    }
+    pub fn fabric_mut(&mut self) -> &mut Fabric {
+        &mut self.fabric
+    }
+    /// Sizes of the Brain-level maps that live outside every pool.
+    ///
+    /// Per-pool accounting reported 425 resident neurons, 0 store-cached
+    /// neurons and empty concept indices while RSS sat at 8.63 GB growing
+    /// ~1 GB/h in 119 mmap'd blocks of 80-282 MB. None of the per-pool
+    /// structures could explain that, so the Brain-level maps -- which no
+    /// eviction path touches -- are what is left to measure.
+    ///
+    /// `lifetime_recurrences` is the prime suspect: one entry per distinct
+    /// moment ever observed, keyed by a `MomentFingerprint` that owns three
+    /// `Vec`s, and only ever cleared wholesale.
+    pub fn global_index_sizes(&self) -> serde_json::Value {
+        // CAPACITY, not len. A `Vec` holds the buffer it grew, and counting
+        // `len` here is the same error `Neuron::footprint` had -- correcting
+        // it there moved `est_resident_mb` at scale 64 from 5.9 to 14.9 MB.
+        fn fp_bytes(fp: &MomentFingerprint) -> usize {
+            fn per_pool(v: &Vec<(PoolId, Vec<NeuronId>)>) -> usize {
+                v.capacity() * std::mem::size_of::<(PoolId, Vec<NeuronId>)>()
+                    + v.iter()
+                        .map(|(_, ids)| ids.capacity() * std::mem::size_of::<NeuronId>())
+                        .sum::<usize>()
+            }
+            std::mem::size_of::<MomentFingerprint>()
+                + fp.legacy_pairs.as_ref().map_or(0, |p| p.capacity())
+                    * std::mem::size_of::<(PoolId, NeuronId)>()
+                + per_pool(&fp.ordered_per_pool)
+                + per_pool(&fp.members_extra)
+        }
+        // The five fingerprint-keyed structures share ONE `Arc` per moment,
+        // so charging each of them the full key would count the same bytes up
+        // to five times — which is exactly the reading that made
+        // `lifetime_recurrences` and `tentative_promoted` look like 5.13 MB
+        // each. Each map is charged its pointer plus its value; the pointee is
+        // charged once, to `fingerprint_keys`.
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut shared = 0usize;
+        let mut charge = |fp: &FpKey| {
+            if seen.insert(std::sync::Arc::as_ptr(fp) as usize) {
+                shared += fp_bytes(fp);
+            }
+            std::mem::size_of::<FpKey>()
+        };
+        // A map allocates for its CAPACITY, not its length, and hashbrown
+        // holds one control byte per slot on top of each (K, V). Charging
+        // per-key understates every one of these by the ~1/8 of the table
+        // that load factor leaves spare plus the whole control array.
+        for k in self.lifetime_recurrences.keys() { charge(k); }
+        for k in self.binding_recurrences.keys() { charge(k); }
+        for k in self.promoted_fingerprints.keys() { charge(k); }
+        for k in self.tentative_promoted.keys() { charge(k); }
+        for fp in self.moment_history.iter() { charge(fp); }
+        let lifetime = hash_table_bytes::<FpKey, u32>(self.lifetime_recurrences.capacity());
+        let recurrences = hash_table_bytes::<FpKey, u32>(self.binding_recurrences.capacity());
+        let promoted = hash_table_bytes::<FpKey, NeuronId>(self.promoted_fingerprints.capacity());
+        let tentative = hash_table_bytes::<FpKey, NeuronId>(self.tentative_promoted.capacity());
+        let history = self.moment_history.capacity() * std::mem::size_of::<FpKey>();
+        let fingerprint_keys = shared;
+        let distinct_fingerprints = seen.len();
+        // The three binding indexes counted `len` on every Vec and charged
+        // nothing for the bucket table the maps themselves allocate. Measured
+        // at scale 64, correcting `len` to `capacity` on the neuron side alone
+        // moved est_resident 5.9 -> 14.9 MB, so an uncounted allocation here is
+        // how a residual stays unnamed.
+        fn ids(v: &Vec<NeuronId>) -> usize {
+            std::mem::size_of::<Vec<NeuronId>>() + v.capacity() * std::mem::size_of::<NeuronId>()
+        }
+        let seq_index: usize = hash_table_bytes::<SequenceRouteDigest, Vec<NeuronId>>(
+            self.binding_sequence_index.capacity(),
+        ) + self
+            .binding_sequence_index
+            .values()
+            .map(ids)
+            .sum::<usize>();
+        let feat_index: usize = hash_table_bytes::<(PoolId, NeuronId), Vec<NeuronId>>(
+            self.binding_feature_atom_index.capacity(),
+        ) + self.binding_feature_atom_index.values().map(ids).sum::<usize>();
+        let motif_index: usize = hash_table_bytes::<(PoolId, [u8; 3]), Vec<NeuronId>>(
+            self.binding_motif_index.capacity(),
+        ) + self.binding_motif_index.values().map(ids).sum::<usize>();
+        serde_json::json!({
+            "bytes": {
+                "fingerprint_keys":           fingerprint_keys,
+                "lifetime_recurrences":       lifetime,
+                "binding_recurrences":        recurrences,
+                "promoted_fingerprints":      promoted,
+                "tentative_promoted":         tentative,
+                "moment_history":             history,
+                "binding_sequence_index":     seq_index,
+                "binding_feature_atom_index": feat_index,
+                "binding_motif_index":        motif_index,
+            },
+            "entries": {
+                "fingerprint_keys":           distinct_fingerprints,
+                "lifetime_recurrences":       self.lifetime_recurrences.len(),
+                "binding_recurrences":        self.binding_recurrences.len(),
+                "promoted_fingerprints":      self.promoted_fingerprints.len(),
+                "tentative_promoted":         self.tentative_promoted.len(),
+                "moment_history":             self.moment_history.len(),
+                "binding_sequence_index":     self.binding_sequence_index.len(),
+                "binding_feature_atom_index": self.binding_feature_atom_index.len(),
+                "binding_motif_index":        self.binding_motif_index.len(),
+            },
+            "total_bytes": fingerprint_keys + lifetime + recurrences + promoted + tentative
+                + history + seq_index + feat_index + motif_index,
+        })
+    }
+
+    pub fn binding_pool_id(&self) -> PoolId {
+        self.binding_pool_id
+    }
+    pub fn min_atom_score(&self) -> f32 {
+        self.config.min_atom_score
+    }
+    pub fn set_min_atom_score(&mut self, value: f32) {
+        self.config.min_atom_score = value.clamp(0.0, 1.0);
+    }
+
+    /// Register a sensor pool.  The caller supplies the atomization
+    /// contract via [`AtomEncoding`].  Returns the assigned pool id.
+    pub fn create_pool(&mut self, config: PoolConfig, encoding: Box<dyn AtomEncoding>) -> PoolId {
+        let pool_id = config.id;
+        let mut pool = Pool::new(config, encoding);
+        if let Some(file) = &self.wbrain_file {
+            pool.set_wbrain_store(file.pool(pool_id));
+        }
+        self.fabric.register_pool(pool)
+    }
+
+    /// Observe a sensor frame into `pool_id`.  Fires atoms; returns
+    /// the IDs that fired.  Multi-pool observation in the same tick
+    /// is the normal mode — call `advance_tick` only when ready to
+    /// close the moment.
+    pub fn observe(&mut self, pool_id: PoolId, frame: &[u8]) -> Vec<NeuronId> {
+        let qa_t0 = std::time::Instant::now();
+        let now = self.fabric.current_tick();
+        // QA capture: if some OTHER pool received a frame within the
+        // last 2 ticks, this frame is its response.  Snapshot a
+        // candidate then mutate qa_db to avoid an iter-and-mutate
+        // borrow conflict.
+        let captured: Option<(PoolId, Vec<u8>)> = self
+            .recent_frames
+            .iter()
+            .filter(|(op, (_, t))| **op != pool_id && now.saturating_sub(*t) <= 2)
+            .max_by_key(|(_, (_, t))| *t)
+            .map(|(op, (f, _))| (*op, f.clone()));
+        if let Some((prompt_pool, prompt_bytes)) = captured {
+            if !frame.is_empty() && !prompt_bytes.is_empty() {
+                self.qa_db.push(QaPair {
+                    prompt_pool,
+                    prompt: prompt_bytes,
+                    response_pool: pool_id,
+                    response: frame.to_vec(),
+                    observed_tick: now,
+                });
+            }
+        }
+        self.recent_frames.insert(pool_id, (frame.to_vec(), now));
+        let qa_capture_ns = qa_t0.elapsed().as_nanos() as u64;
+        self.fabric
+            .observe_profile
+            .qa_capture_ns
+            .fetch_add(qa_capture_ns, std::sync::atomic::Ordering::Relaxed);
+        self.fabric.observe(pool_id, frame)
+    }
+
+    /// Create one atom-grounded multi-pool episode without replaying the
+    /// frames through ordinary within-pool concept emergence.  This is the
+    /// scalable corpus pre-training path: source and native feature atoms are
+    /// preserved as binding members. The target/action frame is collapsed to
+    /// one reusable atom-grounded concept so paraphrases do not duplicate a
+    /// long response membership vector. Repeated live experience can still
+    /// grow higher mini-columns later through `observe`.
+    pub fn pretrain_binding_episode(&mut self, frames: &[(PoolId, Vec<u8>)]) -> Option<NeuronId> {
+        self.pretrain_binding_episode_profiled(frames).0
+    }
+
+    /// Constrain and seed the brain prior to training with the 10 Commandments
+    /// (with the Exodus 20:1-2 introduction) and the commandments Jesus Christ spoke of.
+    pub fn seed_foundational_commandments_prior_to_training(
+        &mut self,
+        query_pool: PoolId,
+        answer_pool: PoolId,
+    ) -> crate::foundational_seed::SeedConstraintReport {
+        crate::foundational_seed::seed_commandments_prior_to_training(self, query_pool, answer_pool)
+    }
+
+    /// Returns the central introduction framing the core prerogatives ("The Lord said this...").
+    pub fn core_prerogative_frame(&self) -> &'static str {
+        crate::foundational_seed::THE_LORD_FRAMING
+    }
+
+    /// Evaluates whether an input or requested action conforms to the core prerogatives.
+    pub fn evaluate_core_prerogatives(&self, text: &str) -> crate::foundational_seed::CorePrerogativeEvaluation {
+        crate::foundational_seed::evaluate_core_prerogatives(text)
+    }
+
+    /// Evaluates input against core prerogatives grounded in the concrete conversation scope.
+    pub fn evaluate_core_prerogatives_contextual(&self, text: &str, context: &str) -> crate::foundational_seed::CorePrerogativeEvaluation {
+        crate::foundational_seed::evaluate_core_prerogatives_contextual(text, context)
+    }
+
+    fn episode_digest(frames: &[(PoolId, Vec<u8>)]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (pool_id, frame) in frames {
+            for b in pool_id.to_le_bytes().iter().chain(frame.iter()) {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h ^= 0xff;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Was this exact frame ever TAUGHT to this brain in this pool?
+    ///
+    /// Consults the binding sequence index directly rather than a separate
+    /// frame-digest set: every promoted binding indexes its ordered atom
+    /// sequence per represented `(query_pool, target_pool)` pair.
+    pub fn is_trained_frame(&self, pool: PoolId, frame: &[u8]) -> bool {
+        if frame.is_empty() || pool == self.binding_pool_id {
+            return false;
+        }
+        let Some(pool_handle) = self.fabric.pool(pool) else {
+            return false;
+        };
+        let sequence: Vec<NeuronId> = {
+            let p = pool_handle.read();
+            let labels = p.encoded_labels(frame);
+            if labels.is_empty() {
+                return false;
+            }
+            let mut seq = Vec::with_capacity(labels.len());
+            for label in labels {
+                let Some(id) = p.label_to_id(&label) else {
+                    return false;
+                };
+                seq.push(id);
+            }
+            seq
+        };
+        self.fabric
+            .pool_ids()
+            .into_iter()
+            .filter(|&target| target != pool && target != self.binding_pool_id)
+            .any(|target| !self.binding_sequence_postings(pool, target, &sequence).is_empty())
+    }
+
+    /// Pretrain one episode while attributing its wall time to the bounded
+    /// stages that can touch the cold neuron/index tiers. The profile is
+    /// observational only and follows the identical learning path above.
+    pub fn pretrain_binding_episode_profiled(
+        &mut self,
+        frames: &[(PoolId, Vec<u8>)],
+    ) -> (Option<NeuronId>, PretrainEpisodeProfile) {
+        let mut profile = PretrainEpisodeProfile::default();
+        let now = self.fabric.current_tick();
+        let mut fired: AHashMap<PoolId, Vec<NeuronId>> = AHashMap::new();
+        let stage = std::time::Instant::now();
+        for (pool_id, frame) in frames {
+            if *pool_id == self.binding_pool_id || frame.is_empty() {
+                continue;
+            }
+            let Some(pool) = self.fabric.pool(*pool_id) else {
+                profile.frame_lookup_ns = stage.elapsed().as_nanos() as u64;
+                return (None, profile);
+            };
+            let (sequence, frame_profile) = if Some(*pool_id) == self.action_pool_id {
+                pool.write()
+                    .ensure_frame_concept_for_pretrain_profiled(frame, now)
+            } else {
+                pool.write()
+                    .ensure_frame_atoms_for_pretrain_profiled(frame, now)
+            };
+            profile.frame_atomize_ns = profile
+                .frame_atomize_ns
+                .saturating_add(frame_profile.atomize_ns);
+            profile.frame_ensure_atoms_ns = profile
+                .frame_ensure_atoms_ns
+                .saturating_add(frame_profile.ensure_atoms_ns);
+            profile.frame_touch_atoms_ns = profile
+                .frame_touch_atoms_ns
+                .saturating_add(frame_profile.touch_atoms_ns);
+            profile.frame_concept_lookup_ns = profile
+                .frame_concept_lookup_ns
+                .saturating_add(frame_profile.concept_lookup_ns);
+            profile.frame_sequence_recurrence_ns = profile
+                .frame_sequence_recurrence_ns
+                .saturating_add(frame_profile.sequence_recurrence_ns);
+            profile.frame_concept_write_ns = profile
+                .frame_concept_write_ns
+                .saturating_add(frame_profile.concept_write_ns);
+            if !sequence.is_empty() {
+                fired.insert(*pool_id, sequence);
+            }
+        }
+        profile.frame_lookup_ns = stage.elapsed().as_nanos() as u64;
+        let stage = std::time::Instant::now();
+        let Some(fingerprint) = MomentFingerprint::from_fabric_moment(&fired) else {
+            profile.fingerprint_ns = stage.elapsed().as_nanos() as u64;
+            return (None, profile);
+        };
+        let fingerprint: FpKey = std::sync::Arc::new(fingerprint);
+        profile.fingerprint_ns = stage.elapsed().as_nanos() as u64;
+        self.total_observations = self.total_observations.saturating_add(1);
+        let stage = std::time::Instant::now();
+        let lifetime = self.increment_lifetime_recurrence(&fingerprint);
+        profile.recurrence_ns = stage.elapsed().as_nanos() as u64;
+
+        let stage = std::time::Instant::now();
+        // A promoted or tentative binding cannot predate its own lifetime
+        // recurrence.  A first observation therefore proves that both cold
+        // binding-state lookups are negative.  At corpus scale those redundant
+        // generation scans caused multi-second random-read tails for novel
+        // episodes even though the one required lifetime lookup took only
+        // milliseconds.
+        let ep_digest = Self::episode_digest(frames);
+        let existing = if let Some(&ep_binding_id) = self.trained_episode_bindings.get(&ep_digest) {
+            Some(ep_binding_id)
+        } else if lifetime > 1 {
+            self.existing_binding_id(&fingerprint)
+        } else {
+            None
+        };
+        profile.binding_lookup_ns = stage.elapsed().as_nanos() as u64;
+        let stage = std::time::Instant::now();
+        let id = if let Some(id) = existing {
+            let members: Vec<NeuronRef> = fingerprint
+                .members_per_pool()
+                .iter()
+                .flat_map(|(pid, ns)| ns.iter().map(|&nid| NeuronRef::new(*pid, nid)))
+                .collect();
+            if let Some(binding_pool) = self.fabric.pool(self.binding_pool_id) {
+                if let Some(neuron) = binding_pool.write().get_mut(id) {
+                    neuron.use_count = neuron.use_count.saturating_add(1);
+                    neuron.last_fired_tick = now;
+                    neuron.members = members.clone();
+                }
+            }
+            self.index_binding_members(id, &members);
+            id
+        } else {
+            let Some(id) = self.promote_binding_concept(&fingerprint) else {
+                profile.binding_write_ns = stage.elapsed().as_nanos() as u64;
+                return (None, profile);
+            };
+            self.tentative_promoted.insert(fingerprint, id);
+            self.tentative_binding_count_total =
+                self.tentative_binding_count_total.saturating_add(1);
+            self.trained_episode_bindings.insert(ep_digest, id);
+            id
+        };
+        profile.binding_write_ns = stage.elapsed().as_nanos() as u64;
+
+        // No frames entered Fabric::current, so advancing performs bounded
+        // housekeeping without cross-wiring every atom pair.
+        let stage = std::time::Instant::now();
+        self.fabric.advance_tick();
+        profile.advance_tick_ns = stage.elapsed().as_nanos() as u64;
+        // The overlay spill must live HERE too, not only in
+        // `Brain::advance_tick`.
+        //
+        // This function advances `self.fabric` directly, so a brain driven
+        // entirely through /pretrain_bindings -- which is exactly what
+        // deferred replay does -- never executes `Brain::advance_tick` and
+        // therefore never reached the size trigger. Measured 2026-09-04 over
+        // 45 unattended minutes: overlay entries climbed 73,821 -> 261,918,
+        // straight past the 250,000 limit, with 0 flushes, 0 errors and no
+        // `overlay flush failed` warning logged, while RSS rose 9.34 -> 10.45
+        // GB. Same shape as the deadlock this trigger was added to fix: the
+        // reclaim existed but sat on a path the workload never took.
+        self.flush_overlay_if_oversized();
+        (Some(id), profile)
+    }
+
+    /// Install a transient, read-only query activation. This does not enter
+    /// recent_frames or the Fabric moment and therefore cannot be learned.
+    pub fn activate_for_prediction(&mut self, pool_id: PoolId, frame: &[u8]) -> Vec<NeuronId> {
+        self.begin_read_only_inference();
+        self.fabric.activate_for_prediction(pool_id, frame)
+    }
+
+    /// Activate the label/member shape needed by posting-index inference
+    /// without paging unrelated terminal vectors into RAM.
+    pub fn activate_for_indexed_prediction(
+        &mut self,
+        pool_id: PoolId,
+        frame: &[u8],
+    ) -> Vec<NeuronId> {
+        self.begin_read_only_inference();
+        self.fabric.activate_shape_for_prediction(pool_id, frame)
+    }
+
+    /// Observe a frame that is being ANSWERED, not learned from.
+    ///
+    /// Identical to [`Self::observe`] except that concept emergence is
+    /// suppressed for the duration, so the question does not enter the
+    /// per-pool recurrence ledger. Measured 2026-09-30 on the scorecard's
+    /// scene world at scale 16: the trained brain peaks at 28.3 MB and then
+    /// answering its 2,432 trained questions with [`Self::observe`] takes the
+    /// process to 546.7 MB, because every atom of every question inserts one
+    /// permanent ledger key per run length 2..=64. Peak RAM therefore tracked
+    /// questions asked rather than knowledge held.
+    ///
+    /// The suppression is scoped to this one call, so a caller that later
+    /// trains on a miss still crystallises normally -- which is the design:
+    /// the brain learns when it is taught or when it misses, not every time
+    /// it is asked something it already knows.
+    /// It also OPENS the read-only inference window, so every body the
+    /// question and its decoder traversal page in is recorded and released by
+    /// [`Self::finish_read_only_inference`]. Measured 2026-10-01 with
+    /// `tools/scorecard.py --stress --with-store`: nothing opened the window on
+    /// any answer path, so `page_ins` equalled `page_outs` exactly at all four
+    /// scales (241/241, 803/803, 3035/3035, 11963/11963), a store-attached run
+    /// ended with 0 neurons evicted and 129,639 terminals resident at scale 64,
+    /// and peak RAM was HIGHER with the store attached (45.8 MB) than without
+    /// it (40.5). The page-OUT half was working; the window was never opened.
+    ///
+    /// This is safe here only because the drain PERSISTS -- see
+    /// [`Pool::evict_wbrain_residents_read_only`]. This wraps [`Self::observe`],
+    /// which does Hebbian terminal updates, so the plain discard would have
+    /// dropped mutated bodies.
+    pub fn observe_read_only(&mut self, pool_id: PoolId, frame: &[u8]) -> Vec<NeuronId> {
+        self.begin_read_only_inference();
+        self.set_emergence_suppressed(true);
+        let fired = self.observe(pool_id, frame);
+        self.set_emergence_suppressed(false);
+        fired
+    }
+
+    /// Observe a frame into the FABRIC while a question is being answered:
+    /// emergence suppressed, and none of the Brain-level bookkeeping that
+    /// [`Self::observe`] performs.
+    ///
+    /// This exists because the node's answer routes reach past `Brain` --
+    /// `brain.fabric_mut().observe(..)` at `crates/node/src/api.rs:8016`
+    /// (`/brain/ask`), `:8146` (the hypothesis research loop) and
+    /// `crates/node/src/brain_api.rs:6089` (the idle thinking loop, every
+    /// 200 ms) -- so [`Self::observe_read_only`] is not a drop-in for them.
+    /// It wraps [`Self::observe`], which also captures a QA pair and inserts
+    /// a `recent_frames` entry; a QA pair harvested from a question being
+    /// ANSWERED is training those routes never asked for. The suppression is
+    /// what they need and the bookkeeping is not, so the suppression gets
+    /// its own fabric-level entry point rather than the callers acquiring a
+    /// behaviour change they did not ask for.
+    ///
+    /// The three routes that DO go through [`Self::observe`] --
+    /// `crates/node/src/bin/brain_server.rs:2379` and `:2446` on `/chat` --
+    /// use [`Self::observe_read_only`] instead, where it IS a drop-in.
+    ///
+    /// Suppression is scoped to this one call, exactly as in
+    /// [`Self::observe_read_only`]: a route that later trains on a miss
+    /// still crystallises normally.
+    /// Nor does it join the current learning moment — see
+    /// [`Fabric::observe_without_moment`] for why that is both a correctness
+    /// fix and the only unbounded allocation a read-only probe was making.
+    /// Opens the read-only inference window for the same reason
+    /// [`Self::observe_read_only`] does, and is safe for the same reason: the
+    /// drain persists. `Fabric::observe_without_moment` still calls
+    /// `Pool::observe_frame`, so this path mutates terminals too.
+    pub fn observe_fabric_read_only(&mut self, pool_id: PoolId, frame: &[u8]) -> Vec<NeuronId> {
+        self.begin_read_only_inference();
+        self.set_emergence_suppressed(true);
+        let fired = self.fabric.observe_without_moment(pool_id, frame);
+        self.set_emergence_suppressed(false);
+        fired
+    }
+
+    fn set_emergence_suppressed(&mut self, suppressed: bool) {
+        for pool_id in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pool_id) {
+                pool.write().set_emergence_suppressed(suppressed);
+            }
+        }
+    }
+
+    fn begin_read_only_inference(&mut self) {
+        for pool_id in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pool_id) {
+                let mut pool = pool.write();
+                if pool.has_wbrain_store() {
+                    pool.begin_read_only_inference();
+                }
+            }
+        }
+    }
+
+    pub fn clear_prediction_activation(&mut self) {
+        self.fabric.clear_prediction_activation();
+    }
+
+    /// End a read-only inference moment and return every demand-paged neuron
+    /// body to its independently addressable `.wbrain` representation.
+    ///
+    /// Prediction is deliberately non-learning: query activation, decoder
+    /// traversal, and diagnostics must not make the request's working set
+    /// permanently resident. Unlike [`Self::serialize_all_neurons_for_idle`]
+    /// this walks only the request's own page-ins rather than every logical
+    /// slot.
+    ///
+    /// It DOES write a body back before dropping it, because the two answer
+    /// entry points that open the window -- [`Self::observe_read_only`] and
+    /// [`Self::observe_fabric_read_only`] -- both reach `Pool::observe_frame`
+    /// and so mutate terminals. A caller that is certain nothing was mutated
+    /// gains nothing from a cheaper drain: `Store::persist_sleeping` is what
+    /// makes the release safe for every caller, and a release that is only
+    /// sometimes safe is how a window stays shut.
+    pub fn finish_read_only_inference(&mut self) -> std::io::Result<usize> {
+        self.clear_prediction_activation();
+        if self.wbrain_file.is_none() {
+            return Ok(0);
+        }
+        let mut released = 0;
+        for pool_id in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pool_id) {
+                let mut pool = pool.write();
+                if pool.has_wbrain_store() {
+                    released += pool.evict_wbrain_residents_read_only()?;
+                }
+            }
+        }
+        Ok(released)
+    }
+
+    /// Close the current tick.  Performs:
+    /// 1. Cross-pool axon wiring for any co-fired pairs (Fabric does this).
+    /// 2. Binding-concept emergence: if the current moment's multi-pool
+    ///    firing fingerprint has recurred ≥ threshold times within the
+    ///    history window, promote it.
+    /// 3. Per-pool housekeeping (decay + prune).
+    pub fn advance_tick(&mut self) {
+        self.execute_feedback_loops();
+        // Snapshot the current moment's firing BEFORE the fabric
+        // advances (which clears it).  Build a fingerprint from
+        // multi-pool firing for binding-concept tracking.  Fabric moments
+        // intentionally contain atoms only to keep cross-pool Hebbian fanout
+        // bounded.  Bindings, however, also need the already-collapsed
+        // concepts or concept-tier inference has nothing to match against.
+        // Enrich this private episodic snapshot with deterministically sorted
+        // firing concepts without exposing them to cross-pool wiring.
+        let fingerprint = {
+            let moment = self.fabric.current_moment();
+            let mut fingerprint = MomentFingerprint::from_fabric_moment(&moment.fired);
+            if let Some(fingerprint) = fingerprint.as_mut() {
+                let pools: Vec<PoolId> = fingerprint
+                    .ordered_per_pool
+                    .iter()
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                for pid in pools {
+                    if pid == self.binding_pool_id {
+                        continue;
+                    }
+                    if let Some(pool) = self.fabric.pool(pid) {
+                        let pool = pool.read();
+                        let mut concepts: Vec<NeuronId> = pool
+                            .currently_firing()
+                            .filter(|nid| pool.get(*nid).is_some_and(|n| !n.is_atom()))
+                            .collect();
+                        concepts.sort_unstable();
+                        // Only the enrichment is stored; the atom stream is
+                        // already in `ordered_per_pool` and is not copied.
+                        if !concepts.is_empty() {
+                            fingerprint.members_extra.push((pid, concepts));
+                        }
+                    }
+                }
+            }
+            fingerprint
+        };
+
+        // Capture per-pool activation frames into the annealer's
+        // history.  One frame per pool per tick; empty frames are
+        // skipped by Annealer::record_frame.  Done BEFORE
+        // advance_tick because the fabric's housekeeping doesn't
+        // clear pool activation, but the next tick's observes will.
+        for pid in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pid) {
+                let p = pool.read();
+                let frame: AHashMap<NeuronId, f32> = p
+                    .currently_firing()
+                    .map(|nid| (nid, p.activation(nid)))
+                    .collect();
+                drop(p);
+                if !frame.is_empty() {
+                    self.annealer.record_frame(pid, frame);
+                }
+            }
+        }
+
+        self.fabric.advance_tick();
+        self.emitted_this_tick.clear();
+
+        if let Some(fp) = fingerprint {
+            self.register_fingerprint(fp);
+        }
+
+        self.flush_overlay_if_oversized();
+    }
+
+    /// Spill the Brain-level overlay to its on-disk posting index once it
+    /// grows past `overlay_flush_entry_limit`.
+    ///
+    /// The overlay (`lifetime_recurrences`, `tentative_promoted`,
+    /// `promoted_fingerprints` and the four binding indexes) lives outside
+    /// every pool, so no eviction path can reclaim it. Before this it was
+    /// cleared ONLY by `flush_binding_posting_overlay` via
+    /// `serialize_all_neurons_for_idle`, reachable only from the
+    /// `/brain/sleep` and `/brain/checkpoint` handlers -- which the
+    /// supervisor calls only after the corpus worker stops at an exact
+    /// guarded boundary (`--checkpoint-rows 131072`).
+    ///
+    /// That is a deadlock, measured 2026-09-04: the overlay grew ~0.7 GB/h
+    /// against 15.6 GB with no swap, pretrain slowed as RAM filled, the 300 s
+    /// `pretrain-bindings` timeout killed the worker at ~row 101568, and the
+    /// boundary that would have freed the memory was never reached. The brain
+    /// could only free this at a checkpoint it could no longer get to, so it
+    /// looked healthy -- ticks advancing, /health answering -- while admitting
+    /// nothing.
+    ///
+    /// Flushing on SIZE decouples reclaiming memory from reaching a row
+    /// boundary. The spill is the same operation the boundary performs, and
+    /// `flush_binding_posting_overlay` already no-ops when the overlay is
+    /// empty, so this only ever does work that was going to happen anyway --
+    /// just sooner, and bounded.
+    fn flush_overlay_if_oversized(&mut self) {
+        let limit = self.overlay_flush_entry_limit;
+        if limit == 0 || self.wbrain_file.is_none() {
+            return;
+        }
+        let entries = self
+            .lifetime_recurrences
+            .len()
+            .saturating_add(self.tentative_promoted.len())
+            .saturating_add(self.promoted_fingerprints.len())
+            .saturating_add(self.binding_sequence_index.len())
+            .saturating_add(self.binding_feature_atom_index.len())
+            .saturating_add(self.binding_feature_pair_index.len())
+            .saturating_add(self.binding_motif_index.len());
+        if entries < limit {
+            return;
+        }
+        match self.flush_binding_posting_overlay() {
+            Ok(()) => {
+                self.overlay_flushes += 1;
+            }
+            Err(error) => {
+                // A failed spill must not wedge training: the overlay stays
+                // in RAM and the next tick past the limit retries. Losing the
+                // flush is a memory problem; losing the tick is a data one.
+                self.overlay_flush_errors += 1;
+                tracing::warn!("overlay flush failed: {}", error);
+            }
+        }
+    }
+
+    /// Overlay entries retained before an automatic spill. 0 disables.
+    pub fn set_overlay_flush_entry_limit(&mut self, limit: usize) {
+        self.overlay_flush_entry_limit = limit;
+    }
+
+    pub fn overlay_flush_stats(&self) -> (u64, u64, usize) {
+        (
+            self.overlay_flushes,
+            self.overlay_flush_errors,
+            self.overlay_flush_entry_limit,
+        )
+    }
+
+    fn execute_feedback_loops(&mut self) {
+        let now = self.fabric.current_tick();
+        let mut newly_scheduled = Vec::new();
+
+        for feedback in &mut self.feedback_loops {
+            let Some(source) = self.fabric.pool(feedback.source_pool) else {
+                continue;
+            };
+            let source = source.read();
+            let mut labels: Vec<String> = source
+                .currently_firing()
+                .filter_map(|id| source.get(id).map(|n| n.label.clone()))
+                .collect();
+            if labels.is_empty() {
+                continue;
+            }
+            labels.sort();
+            labels.dedup();
+            let control = source.control_state();
+            let gain = feedback
+                .spec
+                .gain_mode
+                .as_ref()
+                .map(|mode| mode.evaluate(&control))
+                .unwrap_or(feedback.spec.gain)
+                .max(0.0);
+            drop(source);
+
+            feedback.phase += gain;
+            let spikes = feedback.phase.floor() as usize;
+            feedback.phase -= spikes as f32;
+            if spikes == 0 {
+                continue;
+            }
+
+            // Meta-pools learn a stable pattern-of-patterns fingerprint, not a
+            // recursive copy of every lower-pool label.  This bounds feedback
+            // frame size while preserving exact equality for recurring firing
+            // sets and clean separation for different sets.
+            let joined = labels.join("|");
+            let digest = blake3::hash(joined.as_bytes());
+            let frame =
+                format!("feedback:{}:{}", feedback.spec.signal, digest.to_hex()).into_bytes();
+            for _ in 0..spikes {
+                newly_scheduled.push(ScheduledFeedback {
+                    due_tick: now.saturating_add(feedback.spec.delay_ticks as u64),
+                    target_pool: feedback.target_pool,
+                    frame: frame.clone(),
+                });
+            }
+        }
+
+        self.delayed_feedback.extend(newly_scheduled);
+        let mut pending = Vec::with_capacity(self.delayed_feedback.len());
+        for event in self.delayed_feedback.drain(..) {
+            if event.due_tick <= now {
+                self.fabric.observe(event.target_pool, &event.frame);
+                self.feedback_events_emitted = self.feedback_events_emitted.saturating_add(1);
+            } else {
+                pending.push(event);
+            }
+        }
+        self.delayed_feedback = pending;
+    }
+
+    fn register_fingerprint(&mut self, fp: MomentFingerprint) {
+        // One allocation per observed moment; every index below holds a
+        // pointer to it rather than its own copy of the three Vecs.
+        let fp: FpKey = std::sync::Arc::new(fp);
+        // Decay the oldest entry out of the window.  Lifetime count
+        // does NOT decay — it's the sparse-schedule fallback.
+        if self.moment_history.len() >= self.config.moment_history_window {
+            if let Some(old) = self.moment_history.pop_front() {
+                if let Some(c) = self.binding_recurrences.get_mut(&old) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        self.binding_recurrences.remove(&old);
+                    }
+                }
+            }
+        }
+        self.moment_history.push_back(fp.clone());
+        let win_count = self.binding_recurrences.entry(fp.clone()).or_insert(0);
+        *win_count = win_count.saturating_add(1);
+        let windowed = *win_count;
+
+        let lifetime = self.increment_lifetime_recurrence(&fp);
+
+        self.total_observations = self.total_observations.saturating_add(1);
+
+        // Hebbian frequency tracking: when an EXISTING promoted binding's
+        // fingerprint recurs, bump its use_count so the decoder can weight
+        // it.  This is what makes frequently-trained bindings (toddler
+        // 'cat→animal' trained 8 times in toddler corpus + 3 times in
+        // categorical_unified = 11) dominate competing bindings from
+        // conflicting category entries ('cat→vehicle' trained only 3
+        // times).  Without this, all bindings score by atom precision
+        // (uniformly 1.0 for full overlap) and the decoder's smaller-
+        // target-count tiebreak arbitrarily picks shorter category names.
+        let existing_bid = if lifetime > 1 {
+            self.existing_binding_id(&fp)
+        } else {
+            None
+        };
+        if let Some(bid) = existing_bid {
+            let now = self.fabric.current_tick();
+            let refresh_members = if let Some(bp) = self.fabric.pool(self.binding_pool_id) {
+                let mut bp = bp.write();
+                // Promoted bindings are normally sleeping at production
+                // scale. Recurrence must page this one scoped body before it
+                // can update Hebbian strength or refresh immutable routing;
+                // otherwise maintenance appears to train while doing neither.
+                if bp.ensure_loaded(bid).is_ok() {
+                    let n = bp
+                        .get_mut(bid)
+                        .expect("loaded binding must remain addressable");
+                    n.use_count = n.use_count.saturating_add(1);
+                    n.last_fired_tick = now;
+                    recurrence_posting_refresh_due(n.use_count).then(|| n.members.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(members) = refresh_members {
+                // Recurrent evidence must remain addressable as posting
+                // generations accumulate. Re-advertise the existing neuron;
+                // never allocate or duplicate a learned action. Early powers
+                // of two plus a bounded recurrence cadence let stronger
+                // Hebbian evidence periodically re-enter the live overlay and
+                // guarantee that a finite maintenance pass can refresh it.
+                self.index_binding_members(bid, &members);
+            }
+        }
+
+        // Promotion is driven by whichever signal is stronger: either
+        // a dense recent burst (windowed) or sustained lifetime
+        // co-occurrence (lifetime).  Sparse round-robin training
+        // schedules — where the same pair recurs once every several
+        // thousand ticks — never accumulate windowed count but DO
+        // accumulate lifetime count, so this is the fix for the K-12
+        // failure mode where 22K observations produced zero new
+        // bindings under the old single-signal rule.
+        let effective_count = windowed.max(lifetime);
+
+        let tentative_thr = self.config.tentative_emergence_threshold;
+        let consolidated_thr = self.current_threshold;
+        let already_tentative = lifetime > 1 && self.tentative_binding_id(&fp).is_some();
+        let already_consolidated = lifetime > 1 && self.promoted_binding_id(&fp).is_some();
+
+        // Tier 1: tentative promotion.  Cheap — creates a binding
+        // neuron in the binding pool but no EEM fact and no gossip.
+        // Visible to /chat retrieval; invisible to EEM chain
+        // exploration.
+        if !already_tentative
+            && !already_consolidated
+            && effective_count >= tentative_thr
+            && tentative_thr < u32::MAX
+        {
+            if let Some(id) = self.promote_binding_concept(&fp) {
+                self.tentative_promoted.insert(fp.clone(), id);
+                self.tentative_binding_count_total =
+                    self.tentative_binding_count_total.saturating_add(1);
+            }
+        }
+
+        // Tier 2: consolidated promotion.  Registers an EEM grounded
+        // fact and gossips the motif.  Upgrades the tentative-tier
+        // binding (reuses its neuron id) when one exists.
+        if !already_consolidated && effective_count >= consolidated_thr {
+            let upgrade_id = self
+                .tentative_promoted
+                .remove(&fp)
+                .or_else(|| self.fingerprint_scalar(FINGERPRINT_TENTATIVE_KEY, &fp));
+            let id = match upgrade_id {
+                Some(id) => Some(id),
+                None => self.promote_binding_concept(&fp),
+            };
+            if let Some(id) = id {
+                self.network.pending_motif_out.push(GossipMotif {
+                    source_brain: self.network.brain_id.clone(),
+                    fingerprint: fp.pairs(),
+                    observation_count: effective_count,
+                    local_confidence: (effective_count as f32 / (consolidated_thr.max(1) as f32))
+                        .min(1.0),
+                    observed_at_tick: self.fabric.current_tick(),
+                });
+                self.eem.register_fact(id, fp.pairs());
+                self.promoted_fingerprints.insert(fp, id);
+                if upgrade_id.is_some() {
+                    self.tentative_binding_count_total =
+                        self.tentative_binding_count_total.saturating_sub(1);
+                }
+                self.consolidated_binding_count_total =
+                    self.consolidated_binding_count_total.saturating_add(1);
+            }
+        }
+
+        // Pressure feedback: every `pressure_observation_grace`
+        // observations, nudge `current_threshold` up or down based
+        // on the binding density signal.  Hysteresis: only adjust
+        // when the signal is *outside* the [low, high] band.
+        if self.config.pressure_adjust_enabled
+            && self
+                .total_observations
+                .saturating_sub(self.last_pressure_check_obs)
+                >= self.config.pressure_observation_grace
+        {
+            self.adjust_threshold_by_pressure();
+            self.last_pressure_check_obs = self.total_observations;
+        }
+    }
+
+    /// Bindings-per-observation ratio — the input to the pressure
+    /// feedback loop.  Counts both tiers because both are valid
+    /// bindings; the EEM-fact gate is what separates them.
+    pub fn binding_pressure(&self) -> f32 {
+        if self.total_observations == 0 {
+            return 0.0;
+        }
+        let total_bindings =
+            self.tentative_binding_count_total + self.consolidated_binding_count_total;
+        (total_bindings as f32) / (self.total_observations as f32)
+    }
+
+    /// One step of the pressure feedback loop.  Public so callers
+    /// (e.g. the supervisor) can force a recheck outside the
+    /// observation-grace schedule.  Returns the *new* threshold.
+    pub fn adjust_threshold_by_pressure(&mut self) -> u32 {
+        let pressure = self.binding_pressure();
+        let low = self.config.pressure_band_low;
+        let high = self.config.pressure_band_high;
+        let max = self.config.pressure_threshold_max.max(1);
+
+        if pressure < low && self.current_threshold > 1 {
+            self.current_threshold -= 1;
+        } else if pressure > high && self.current_threshold < max {
+            self.current_threshold += 1;
+        }
+        self.current_threshold
+    }
+
+    /// Failure-feedback hook: force-promote every fingerprint whose
+    /// lifetime recurrence count is at least `min_count`, regardless
+    /// of whether the windowed signal has decayed it.  Used by
+    /// `/chat` when an OOV miss is reported — the system says "I
+    /// don't know" precisely because the would-be binding never
+    /// crossed threshold; this lets the next retrieval find it.
+    ///
+    /// Returns the list of fingerprint neuron ids that were newly
+    /// tentative-promoted by this call.  Already-promoted
+    /// fingerprints are not re-promoted (idempotent).
+    pub fn force_promote_tentative(&mut self, min_count: u32) -> Vec<NeuronId> {
+        let candidates: Vec<FpKey> = self
+            .lifetime_recurrences
+            .iter()
+            .filter(|&(_, c)| *c >= min_count)
+            .filter(|&(fp, _)| {
+                self.tentative_binding_id(fp).is_none() && self.promoted_binding_id(fp).is_none()
+            })
+            .map(|(fp, _)| fp.clone())
+            .collect();
+        let mut out = Vec::with_capacity(candidates.len());
+        for fp in candidates {
+            if let Some(id) = self.promote_binding_concept(&fp) {
+                self.tentative_promoted.insert(fp, id);
+                self.tentative_binding_count_total =
+                    self.tentative_binding_count_total.saturating_add(1);
+                out.push(id);
+            }
+        }
+
+        // Historical recurrence state is paged. Scan one immutable posting
+        // generation and one fingerprint key at a time instead of hydrating
+        // the corpus-sized recurrence map. Newest generations are visited
+        // first; tier lookups make duplicate keys across deltas idempotent.
+        let Some(file) = self.wbrain_file.clone() else {
+            return out;
+        };
+        let store = file.pool(self.binding_pool_id);
+        let references = self.fingerprint_candidate_indexes.clone();
+        for reference in references.into_iter().rev() {
+            let result = crate::store::posting_index::scan_prefix(
+                &store,
+                reference,
+                &[FINGERPRINT_LIFETIME_KEY],
+                |key, count| {
+                    if count < min_count {
+                        return Ok(());
+                    }
+                    let Some(fp) = decode_fingerprint_posting_key(key, FINGERPRINT_LIFETIME_KEY)
+                    else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid lifetime fingerprint posting key",
+                        ));
+                    };
+                    // Pair-only legacy snapshots did not retain temporal
+                    // order. Promoting those records in isolation would
+                    // invent an order; their persisted count is instead
+                    // folded into the next live, fully ordered episode.
+                    if fp.ordered_per_pool.is_empty() {
+                        return Ok(());
+                    }
+                    if self.tentative_binding_id(&fp).is_some()
+                        || self.promoted_binding_id(&fp).is_some()
+                    {
+                        return Ok(());
+                    }
+                    let fp: FpKey = std::sync::Arc::new(fp);
+                    if let Some(id) = self.promote_binding_concept(&fp) {
+                        self.tentative_promoted.insert(fp, id);
+                        self.tentative_binding_count_total =
+                            self.tentative_binding_count_total.saturating_add(1);
+                        out.push(id);
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(error) = result {
+                tracing::warn!("fingerprint recurrence scan failed: {}", error);
+                break;
+            }
+        }
+        out
+    }
+
+    /// Number of bindings in the tentative tier (binding-pool neuron
+    /// exists, no EEM fact registered yet).
+    pub fn tentative_binding_count(&self) -> usize {
+        self.tentative_binding_count_total
+    }
+
+    /// Number of bindings in the consolidated tier (EEM fact registered).
+    pub fn consolidated_binding_count(&self) -> usize {
+        self.consolidated_binding_count_total
+    }
+
+    /// Current pressure-adjusted consolidated emergence threshold.
+    pub fn current_emergence_threshold(&self) -> u32 {
+        self.current_threshold
+    }
+
+    /// Total observations (advance_tick calls with non-empty
+    /// fingerprint) since construction or last snapshot restore.
+    pub fn total_observations(&self) -> u64 {
+        self.total_observations
+    }
+
+    fn promote_binding_concept(&mut self, fp: &MomentFingerprint) -> Option<NeuronId> {
+        let binding_pool = self.fabric.pool(self.binding_pool_id)?;
+        let mut binding = binding_pool.write();
+        // The label is a dedup key and nothing else -- it is written once and
+        // only ever read back through `label_to_id`; nothing parses it. It used
+        // to SPELL the membership ("p1n0|p1n0|p1n0|p1n2|..." plus an ordered
+        // hash), so it grew with the fact: measured at scale 64 of the
+        // scorecard, 170 bytes per binding, held once in `pool.label_index`
+        // (1.65 MB) and again in the neuron. A symbol names the same episode
+        // in 35 bytes whatever its length. Two independent 64-bit digests
+        // because one is too narrow to key a corpus-scale binding pool on.
+        let label = binding_label(fp);
+        if let Some(existing) = binding.label_to_id(&label) {
+            return Some(existing); // already exists, idempotent.
+        }
+        // Snapshots written before the symbol carry the spelled-out label.
+        // Building it costs a temporary on the promotion path only; nothing
+        // stores it, so an old brain still dedups instead of growing a second
+        // neuron for an episode it already holds.
+        if let Some(existing) = binding.label_to_id(&legacy_binding_label(fp)) {
+            return Some(existing);
+        }
+        // Members stored in FIRING ORDER (per-pool sequence as
+        // observed at training time), NOT NeuronId-sorted order.
+        // This preserves the temporal order required for clean
+        // decoding via decode_concept_members — without it,
+        // 'animal' atoms (a,n,i,m,a,l) decode as 'aaniml' because
+        // sorting by NeuronId interleaves the duplicates.
+        let members: Vec<NeuronRef> = fp
+            .members_per_pool()
+            .iter()
+            .flat_map(|(pid, ns)| ns.iter().map(|&nid| NeuronRef::new(*pid, nid)))
+            .collect();
+        let max_w = binding.config.max_weight;
+        let now = self.fabric.current_tick();
+        // Lossless action/code bytes remain members of the binding concept,
+        // but do not each need a second pair of propagation terminals.  A
+        // long source response can contain thousands of repeated byte atoms;
+        // wiring every occurrence bidirectionally caused terminal growth to
+        // dominate both RAM and novel-query propagation.  Exact retrieval
+        // decodes these atom-grounded members directly, while sensory and
+        // internal evidence members retain Hebbian propagation wiring.
+        let terminal_members: Vec<NeuronRef> = members
+            .iter()
+            .copied()
+            .filter(|member| {
+                if Some(member.pool) != self.action_pool_id {
+                    return true;
+                }
+                self.fabric
+                    .pool(member.pool)
+                    .and_then(|pool| pool.read().get(member.neuron).map(|n| !n.is_atom()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Create the binding concept directly with cross-pool members.
+        let id = binding.neuron_count() as NeuronId;
+        let mut neuron = Neuron::new_concept(
+            id,
+            label.clone(),
+            NeuronKind::Excitatory,
+            members.clone(),
+            now,
+        );
+        // Wire concept → member terminals top-down so activating the
+        // binding fires its constituent neurons in all pools.
+        let mut added: usize = 0;
+        for m in &terminal_members {
+            if neuron.reinforce_terminal(*m, 0.5, now, max_w) {
+                added += 1;
+            }
+        }
+        // append_neuron pushes the new concept (with its `added` terminals
+        // already attached) onto the binding pool, so the counter grows
+        // by exactly `added`.
+        binding.total_terminals += added;
+        binding.append_neuron(neuron, label.clone());
+        drop(binding);
+
+        // Wire member → binding terminals bottom-up so co-firing all
+        // members activates the binding.
+        //
+        // Bounded per `PoolConfig::max_atom_fanout`. This is the site that
+        // produced the hub: one binding per trained fact, each wiring every
+        // member ATOM to itself, so a byte that occurs in every question ends
+        // up with one terminal per fact. Measured 2026-09-30 at scale 16 of the
+        // scorecard, `q:cg`, `q:IA` and `q:Pw` each held 2,432 -- the fact
+        // count exactly -- against 21 on the largest concept. The binding keeps
+        // its top-down terminals above, and `binding_sequence_index` /
+        // `binding_feature_atom_index` already address a binding from its
+        // members by lookup, so the cap removes fan-out and not reachability.
+        //
+        // THE BOUND STAYS FIRST-COME HERE, AND THAT IS MEASURED RATHER THAN
+        // INHERITED. `Neuron::reinforce_terminal_bounded` keeps the same bound
+        // and displaces the weakest resident instead, which is the obviously
+        // better rule and is wrong at THIS call site. Wired here 2026-10-01 it
+        // turned `tests/empty_integration_is_budget_starvation.rs` red: the
+        // taught cut `"r000 lamp on?"` scored 1.0000 at 8 and 128 rooms and
+        // 0.9091 at 512, below the deletion search's `>= 1.0` acceptance, and
+        // the derivation that depends on it answered NOTHING at 512 rooms.
+        //
+        // The arithmetic says why, and it generalises past this one test. Every
+        // atom→binding terminal is created at the same `delta = 0.5` and
+        // `Neuron::effective_weight` applies no tick decay of its own, so
+        // "strongest resident" degenerates to "most recently trained" as soon
+        // as decay has moved an older weight below 0.5. Displacement therefore
+        // evicts the EARLIEST facts -- and 8 and 128 rooms are unaffected only
+        // because 24 and 384 facts sit under the 512 cap, while 512 rooms is
+        // 1,536. Refusing the newest terminal and evicting the oldest are both
+        // arbitrary halves of the same corpus; the second one additionally
+        // breaks the facts a probe is most likely to be about, and it silently
+        // degrades `probe_question_score` below the exact-match acceptance the
+        // whole derivation is gated on.
+        //
+        // So the pathology this bound has -- an atom that fills on the opening
+        // facts acquires nothing afterwards -- is NOT fixed by re-selecting
+        // under it. It needs the terminals kept and paged (the SSD zoom), which
+        // is the only version that does not trade one half of the corpus for
+        // the other. `reinforce_terminal_bounded` stays wired at the concept
+        // site, where the member count bounds fan-out anyway.
+        let binding_ref = NeuronRef::new(self.binding_pool_id, id);
+        for m in &terminal_members {
+            if let Some(p) = self.fabric.pool(m.pool) {
+                p.write().reinforce_atom_terminal_keeping_overflow(
+                    m.neuron,
+                    binding_ref,
+                    0.5,
+                    now,
+                );
+            }
+        }
+        self.index_binding_members(id, &members);
+        Some(id)
+    }
+
+    fn binding_posting_keys(&mut self, members: &[NeuronRef]) -> Vec<BindingPostingKey> {
+        let mut keys = Vec::new();
+        let represented: Vec<PoolId> = members
+            .iter()
+            .map(|member| member.pool)
+            .collect::<ahash::AHashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut roots_by_pool: AHashMap<PoolId, Vec<NeuronId>> = AHashMap::new();
+        for member in members {
+            roots_by_pool
+                .entry(member.pool)
+                .or_default()
+                .push(member.neuron);
+        }
+        for (&pool_id, roots) in &roots_by_pool {
+            let Some(pool_handle) = self.fabric.pool(pool_id) else {
+                continue;
+            };
+            ensure_neuron_trees_loaded(&mut pool_handle.write(), roots);
+            let pool = pool_handle.read();
+            let mut atoms = ahash::AHashSet::new();
+            let mut pending = roots.clone();
+            let mut visited = ahash::AHashSet::new();
+            while let Some(neuron_id) = pending.pop() {
+                if !visited.insert(neuron_id) {
+                    continue;
+                }
+                let Some(neuron) = pool.get(neuron_id) else {
+                    continue;
+                };
+                if neuron.is_atom() {
+                    atoms.insert(neuron_id);
+                } else {
+                    pending.extend(
+                        neuron
+                            .members
+                            .iter()
+                            .filter(|member| member.pool == pool_id)
+                            .map(|member| member.neuron),
+                    );
+                }
+            }
+            let mut atoms: Vec<_> = atoms.into_iter().collect();
+            atoms.sort_unstable();
+            for &atom in &atoms {
+                keys.push(BindingPostingKey::Feature(pool_id, atom));
+            }
+            // Pairwise keys are restricted to sparse semantic sensors. Raw
+            // character/code pools can expose hundreds of atoms and would
+            // create a quadratic posting explosion without adding independent
+            // intent evidence.
+            if pool.encoding_name() == "instruction-intent" {
+                const MAX_COMPOSITE_FEATURE_ATOMS: usize = 16;
+                atoms.truncate(MAX_COMPOSITE_FEATURE_ATOMS);
+                for left_index in 0..atoms.len() {
+                    for &right in &atoms[left_index + 1..] {
+                        keys.push(BindingPostingKey::FeaturePair(
+                            pool_id,
+                            atoms[left_index],
+                            right,
+                        ));
+                    }
+                }
+            }
+        }
+        // Atom/concept identity is available only after the requested member
+        // roots have been paged. Classifying sleeping slots before this point
+        // silently omitted exact sequence and motif routes during migration.
+        let mut atom_sequences: AHashMap<PoolId, Vec<NeuronId>> = AHashMap::new();
+        for member in members {
+            let Some(pool) = self.fabric.pool(member.pool) else {
+                continue;
+            };
+            let pool_read = pool.read();
+            if let Some(leaves) = pool_read.expand_to_atom_leaves_bounded(&[member.neuron], 512) {
+                atom_sequences
+                    .entry(member.pool)
+                    .or_default()
+                    .extend(leaves);
+            }
+        }
+        for (&query_pool, sequence) in &atom_sequences {
+            if sequence.is_empty() {
+                continue;
+            }
+            for &target_pool in &represented {
+                if target_pool == query_pool {
+                    continue;
+                }
+                keys.push(BindingPostingKey::Sequence(
+                    query_pool,
+                    target_pool,
+                    sequence.clone(),
+                ));
+            }
+            if let Some(pool) = self.fabric.pool(query_pool) {
+                let pool = pool.read();
+                let refs: Vec<NeuronRef> = sequence
+                    .iter()
+                    .map(|&neuron| NeuronRef {
+                        pool: query_pool,
+                        neuron,
+                    })
+                    .collect();
+                let frame = pool.decode_concept_members(&refs);
+                for motif in normalized_char_motifs(&frame) {
+                    keys.push(BindingPostingKey::Motif(query_pool, motif));
+                }
+            }
+        }
+        keys
+    }
+
+    fn index_binding_members(&mut self, binding_id: NeuronId, members: &[NeuronRef]) {
+        for key in self.binding_posting_keys(members) {
+            match key {
+                BindingPostingKey::Sequence(query, target, sequence) => {
+                    // Measured at scale 64: 9,742 routes against 9,728 facts,
+                    // so virtually every exact-sequence route posts ONE
+                    // binding. `Vec::push` on an empty vector allocates four
+                    // slots, charging 16 bytes to hold 4 -- 117 KB of the
+                    // index. Start at one and let doubling take over.
+                    let ids = self
+                        .binding_sequence_index
+                        .entry(sequence_route_digest(query, target, &sequence))
+                        .or_insert_with(|| Vec::with_capacity(1));
+                    append_binding_posting(ids, binding_id, usize::MAX);
+                }
+                BindingPostingKey::Feature(pool, neuron) => {
+                    let ids = self
+                        .binding_feature_atom_index
+                        .entry((pool, neuron))
+                        .or_default();
+                    append_binding_posting(ids, binding_id, usize::MAX);
+                }
+                BindingPostingKey::FeaturePair(pool, left, right) => {
+                    let ids = self
+                        .binding_feature_pair_index
+                        .entry((pool, left.min(right), left.max(right)))
+                        .or_default();
+                    append_binding_posting(ids, binding_id, usize::MAX);
+                }
+                BindingPostingKey::Motif(pool, motif) => {
+                    let ids = self.binding_motif_index.entry((pool, motif)).or_default();
+                    append_binding_posting(ids, binding_id, 512);
+                }
+            }
+        }
+    }
+
+    /// Emit the rebuild postings while retaining at most one neuron body.
+    /// The generic live-learning helper intentionally keeps a whole requested
+    /// tree resident for inference reuse; migration finalization instead
+    /// streams each shape and releases it immediately.
+    fn stream_binding_posting_keys_bounded(
+        &mut self,
+        members: &[NeuronRef],
+        binding_id: NeuronId,
+        builder: &mut crate::store::posting_index::PostingIndexBuilder,
+    ) -> std::io::Result<()> {
+        let represented: Vec<PoolId> = members
+            .iter()
+            .map(|member| member.pool)
+            .collect::<ahash::AHashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut roots_by_pool: AHashMap<PoolId, Vec<NeuronId>> = AHashMap::new();
+        let mut atom_sequences: AHashMap<PoolId, Vec<NeuronId>> = AHashMap::new();
+        let mut atom_frames: AHashMap<PoolId, Vec<u8>> = AHashMap::new();
+        let mut root_shapes: AHashMap<(PoolId, NeuronId), (bool, Vec<NeuronRef>, Vec<u8>)> =
+            AHashMap::new();
+
+        for member in members {
+            roots_by_pool
+                .entry(member.pool)
+                .or_default()
+                .push(member.neuron);
+            let Some(pool) = self.fabric.pool(member.pool) else {
+                continue;
+            };
+            if let Some(shape) = pool.write().read_neuron_shape_bounded(member.neuron)? {
+                if shape.0 {
+                    atom_sequences
+                        .entry(member.pool)
+                        .or_default()
+                        .push(member.neuron);
+                    atom_frames
+                        .entry(member.pool)
+                        .or_default()
+                        .extend_from_slice(&shape.2);
+                }
+                // The traversal starts at these same roots. Retain only their
+                // compact shape for this binding so each serialized root is
+                // opened once, not once for ordering and again for flattening.
+                root_shapes.insert((member.pool, member.neuron), shape);
+            }
+        }
+
+        for (&pool_id, roots) in &roots_by_pool {
+            let Some(pool) = self.fabric.pool(pool_id) else {
+                continue;
+            };
+            let composite_semantic_pool =
+                pool.read().encoding_name() == "instruction-intent";
+            let mut composite_atoms = Vec::new();
+            let mut pending = roots.clone();
+            let mut visited = ahash::AHashSet::new();
+            while let Some(neuron_id) = pending.pop() {
+                if !visited.insert(neuron_id) {
+                    continue;
+                }
+                let shape = if let Some(shape) = root_shapes.remove(&(pool_id, neuron_id)) {
+                    Some(shape)
+                } else if !pool.read().is_concept_slot(neuron_id) {
+                    // Atom/concept identity lives in the compact paged slot
+                    // directory. Descendant atoms need no body read: their
+                    // stable id is already the feature posting key.
+                    builder.insert(
+                        &BindingPostingKey::Feature(pool_id, neuron_id).encode(),
+                        binding_id,
+                    )?;
+                    if composite_semantic_pool {
+                        composite_atoms.push(neuron_id);
+                    }
+                    continue;
+                } else {
+                    pool.write().read_neuron_shape_bounded(neuron_id)?
+                };
+                let Some((is_atom, children, _)) = shape else {
+                    continue;
+                };
+                if is_atom {
+                    builder.insert(
+                        &BindingPostingKey::Feature(pool_id, neuron_id).encode(),
+                        binding_id,
+                    )?;
+                    if composite_semantic_pool {
+                        composite_atoms.push(neuron_id);
+                    }
+                } else {
+                    pending.extend(
+                        children
+                            .into_iter()
+                            .filter(|member| member.pool == pool_id)
+                            .map(|member| member.neuron),
+                    );
+                }
+            }
+            if composite_semantic_pool {
+                const MAX_COMPOSITE_FEATURE_ATOMS: usize = 16;
+                composite_atoms.sort_unstable();
+                composite_atoms.dedup();
+                composite_atoms.truncate(MAX_COMPOSITE_FEATURE_ATOMS);
+                for left_index in 0..composite_atoms.len() {
+                    for &right in &composite_atoms[left_index + 1..] {
+                        builder.insert(
+                            &BindingPostingKey::FeaturePair(
+                                pool_id,
+                                composite_atoms[left_index],
+                                right,
+                            )
+                            .encode(),
+                            binding_id,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        for (&query_pool, sequence) in &atom_sequences {
+            if sequence.is_empty() {
+                continue;
+            }
+            for &target_pool in &represented {
+                if target_pool != query_pool {
+                    builder.insert(
+                        &BindingPostingKey::Sequence(query_pool, target_pool, sequence.clone())
+                            .encode(),
+                        binding_id,
+                    )?;
+                }
+            }
+            if let Some(frame) = atom_frames.get(&query_pool) {
+                for motif in normalized_char_motifs(frame) {
+                    builder.insert(
+                        &BindingPostingKey::Motif(query_pool, motif).encode(),
+                        binding_id,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep bounded attention representative across immutable experience
+    /// generations instead of allowing the newest overlay/generation to
+    /// consume the complete candidate window.
+    ///
+    /// Deterministic validators operate after posting lookup because they
+    /// inspect atom-grounded target bytes. If one high-volume corpus interval
+    /// fills the posting cap first, an older correct episode remains persisted
+    /// but becomes impossible to validate. Reserve an equal first-pass quota
+    /// for every source, then spend unused capacity newest-first. Memory and
+    /// neuron page-in stay bounded by `limit`, independent of corpus size.
+    /// Counting shell over [`Self::bounded_binding_postings_inner`]. The inner
+    /// routine has three exits and the measurement has to cover all of them,
+    /// so it is taken once here on the value every caller actually receives.
+    fn bounded_binding_postings_across_generations(
+        &self,
+        key: &BindingPostingKey,
+        overlay: &[NeuronId],
+        limit: usize,
+    ) -> Vec<NeuronId> {
+        let out = self.bounded_binding_postings_inner(key, overlay, limit);
+        self.posting_caps.record(key, limit > 0 && out.len() >= limit);
+        out
+    }
+
+    /// Snapshot of how often each posting key kind came back FULL. Cumulative
+    /// over the brain's life; see [`PostingCapStats::minus`] to attribute it
+    /// to one phase.
+    pub fn posting_cap_stats(&self) -> PostingCapStats {
+        self.posting_caps.snapshot()
+    }
+
+    fn bounded_binding_postings_inner(
+        &self,
+        key: &BindingPostingKey,
+        overlay: &[NeuronId],
+        limit: usize,
+    ) -> Vec<NeuronId> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let references: Vec<_> = self.binding_posting_indexes.iter().rev().copied().collect();
+        let source_count = references.len() + usize::from(!overlay.is_empty());
+        if source_count == 0 {
+            return Vec::new();
+        }
+        let quota = (limit / source_count).max(1);
+        let mut out = Vec::with_capacity(limit);
+        let mut seen = ahash::AHashSet::with_capacity(limit);
+        fn append_unique(
+            out: &mut Vec<NeuronId>,
+            seen: &mut ahash::AHashSet<NeuronId>,
+            ids: &[NeuronId],
+            limit: usize,
+        ) {
+            for &id in ids {
+                if out.len() >= limit {
+                    break;
+                }
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+        }
+
+        // The live overlay is the newest experience generation. Select its
+        // newest entries so a freshly learned repair is immediately visible.
+        let overlay_start = overlay.len().saturating_sub(quota);
+        append_unique(&mut out, &mut seen, &overlay[overlay_start..], limit);
+        let Some(file) = self.wbrain_file.as_ref() else {
+            return out;
+        };
+        let store = file.pool(self.binding_pool_id);
+        let encoded = key.encode();
+        for reference in &references {
+            match crate::store::posting_index::lookup(&store, *reference, &encoded, quota) {
+                Ok(ids) => append_unique(&mut out, &mut seen, &ids, limit),
+                Err(error) => {
+                    tracing::warn!("binding posting lookup failed: {}", error);
+                    break;
+                }
+            }
+        }
+
+        // Sources whose key is absent leave quota unused. Spend that remainder
+        // newest-first only after every generation had a chance to contribute.
+        if out.len() < limit {
+            let overlay_start = overlay.len().saturating_sub(limit);
+            append_unique(&mut out, &mut seen, &overlay[overlay_start..], limit);
+        }
+        for reference in &references {
+            if out.len() >= limit {
+                break;
+            }
+            match crate::store::posting_index::lookup(&store, *reference, &encoded, limit) {
+                Ok(ids) => append_unique(&mut out, &mut seen, &ids, limit),
+                Err(error) => {
+                    tracing::warn!("binding posting lookup failed: {}", error);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn disk_scalar(&self, encoded_key: &[u8]) -> Option<u32> {
+        let file = self.wbrain_file.as_ref()?;
+        let store = file.pool(self.binding_pool_id);
+        for reference in self.fingerprint_posting_indexes.iter().rev() {
+            match crate::store::posting_index::lookup(&store, *reference, encoded_key, 1) {
+                Ok(values) => {
+                    if let Some(value) = values.into_iter().next() {
+                        return Some(value);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("fingerprint state lookup failed: {}", error);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    fn fingerprint_scalar(&self, kind: u8, fingerprint: &MomentFingerprint) -> Option<u32> {
+        let key =
+            encode_fingerprint_posting_key(kind, &fingerprint.pairs(), &fingerprint.ordered_per_pool);
+        self.disk_scalar(&key).or_else(|| {
+            if fingerprint.ordered_per_pool.is_empty() {
+                return None;
+            }
+            // Legacy bincode checkpoints persisted only the canonical pair
+            // signature. Their migrated records use an empty order suffix;
+            // the next live episode supplies exact temporal order if the
+            // historical count causes a new promotion.
+            self.disk_scalar(&encode_fingerprint_posting_key(
+                kind,
+                &fingerprint.pairs(),
+                &[],
+            ))
+        })
+    }
+
+    fn lifetime_recurrence(&self, fingerprint: &MomentFingerprint) -> u32 {
+        self.lifetime_recurrences
+            .get(fingerprint)
+            .copied()
+            .or_else(|| self.fingerprint_scalar(FINGERPRINT_LIFETIME_KEY, fingerprint))
+            .unwrap_or(0)
+    }
+
+    fn increment_lifetime_recurrence(&mut self, fingerprint: &FpKey) -> u32 {
+        if let Some(count) = self.lifetime_recurrences.get_mut(fingerprint) {
+            *count = count.saturating_add(1);
+            return *count;
+        }
+        let next = self.lifetime_recurrence(fingerprint).saturating_add(1);
+        self.lifetime_recurrences
+            .insert(std::sync::Arc::clone(fingerprint), next);
+        next
+    }
+
+    fn tentative_binding_id(&self, fingerprint: &MomentFingerprint) -> Option<NeuronId> {
+        self.tentative_promoted
+            .get(fingerprint)
+            .copied()
+            .or_else(|| self.fingerprint_scalar(FINGERPRINT_TENTATIVE_KEY, fingerprint))
+    }
+
+    fn promoted_binding_id(&self, fingerprint: &MomentFingerprint) -> Option<NeuronId> {
+        self.promoted_fingerprints
+            .get(fingerprint)
+            .copied()
+            .or_else(|| self.fingerprint_scalar(FINGERPRINT_PROMOTED_KEY, fingerprint))
+    }
+
+    fn existing_binding_id(&self, fingerprint: &MomentFingerprint) -> Option<NeuronId> {
+        self.promoted_binding_id(fingerprint)
+            .or_else(|| self.tentative_binding_id(fingerprint))
+    }
+
+    fn binding_sequence_postings(
+        &self,
+        query: PoolId,
+        target: PoolId,
+        sequence: &[NeuronId],
+    ) -> Vec<NeuronId> {
+        // Exact sensory identity is authoritative, but it is not permission
+        // to hydrate every episode that ever observed a common sequence.
+        // Repeated prompts can have corpus-scale posting lists. Keep exact
+        // attention bounded and generation-fair just like feature and motif
+        // attention so an old established response and a new repair both
+        // remain eligible without waking the complete history.
+        const MAX_EXACT_POSTINGS: usize = 512;
+        let overlay = self
+            .binding_sequence_index
+            .get(&sequence_route_digest(query, target, sequence))
+            .cloned()
+            .unwrap_or_default();
+        self.bounded_binding_postings_across_generations(
+            &BindingPostingKey::Sequence(query, target, sequence.to_vec()),
+            &overlay,
+            MAX_EXACT_POSTINGS,
+        )
+    }
+
+    fn binding_feature_postings(&self, pool: PoolId, neuron: NeuronId) -> Vec<NeuronId> {
+        const MAX_FEATURE_POSTINGS: usize = 512;
+        let overlay = self
+            .binding_feature_atom_index
+            .get(&(pool, neuron))
+            .cloned()
+            .unwrap_or_default();
+        self.bounded_binding_postings_across_generations(
+            &BindingPostingKey::Feature(pool, neuron),
+            &overlay,
+            MAX_FEATURE_POSTINGS,
+        )
+    }
+
+    fn binding_feature_pair_postings(
+        &self,
+        pool: PoolId,
+        left: NeuronId,
+        right: NeuronId,
+    ) -> Vec<NeuronId> {
+        const MAX_COMPOSITE_POSTINGS: usize = 512;
+        let key = (pool, left.min(right), left.max(right));
+        let overlay = self
+            .binding_feature_pair_index
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        self.bounded_binding_postings_across_generations(
+            &BindingPostingKey::FeaturePair(key.0, key.1, key.2),
+            &overlay,
+            MAX_COMPOSITE_POSTINGS,
+        )
+    }
+
+    fn feature_route_evidence(
+        &self,
+        feature_pool: PoolId,
+        query_atoms: &ahash::AHashSet<NeuronId>,
+    ) -> (AHashMap<NeuronId, u16>, FeatureRoutePressure) {
+        let mut atoms: Vec<_> = query_atoms.iter().copied().collect();
+        atoms.sort_unstable();
+        atoms.truncate(16);
+        let is_semantic = self
+            .fabric
+            .pool(feature_pool)
+            .is_some_and(|pool| pool.read().encoding_name() == "instruction-intent");
+        let mut evidence = AHashMap::new();
+        let mut pressure = FeatureRoutePressure::default();
+        if is_semantic {
+            for left_index in 0..atoms.len() {
+                for &right in &atoms[left_index + 1..] {
+                    let ids = self.binding_feature_pair_postings(
+                        feature_pool,
+                        atoms[left_index],
+                        right,
+                    );
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    pressure.composite_keys += 1;
+                    pressure.composite_saturated |= ids.len() >= 512;
+                    add_binding_evidence(&mut evidence, ids);
+                }
+            }
+            pressure.composite_candidates = evidence.len();
+        }
+        if evidence.is_empty() {
+            for atom in query_atoms {
+                add_binding_evidence(
+                    &mut evidence,
+                    self.binding_feature_postings(feature_pool, *atom),
+                );
+            }
+        }
+        (evidence, pressure)
+    }
+
+    /// Report composite-route pressure without hydrating candidate bodies.
+    /// A saturated key is an early-warning signal, not permission to widen the
+    /// global attention cap or to mutate an accepted brain outside a guard.
+    pub fn feature_route_pressure(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+    ) -> FeatureRoutePressure {
+        let Some(feature_handle) = self.fabric.pool(feature_pool) else {
+            return FeatureRoutePressure::default();
+        };
+        let query_atoms = {
+            let feature = feature_handle.read();
+            query_labels
+                .iter()
+                .filter_map(|label| feature.label_to_id(label))
+                .collect()
+        };
+        self.feature_route_evidence(feature_pool, &query_atoms).1
+    }
+
+    fn binding_motif_postings(&self, pool: PoolId, motif: [u8; 3]) -> Vec<NeuronId> {
+        const MAX_MOTIF_POSTINGS: usize = 512;
+        let overlay = self
+            .binding_motif_index
+            .get(&(pool, motif))
+            .cloned()
+            .unwrap_or_default();
+        self.bounded_binding_postings_across_generations(
+            &BindingPostingKey::Motif(pool, motif),
+            &overlay,
+            MAX_MOTIF_POSTINGS,
+        )
+    }
+
+    fn flush_binding_posting_overlay(&mut self) -> std::io::Result<()> {
+        let Some(file) = self.wbrain_file.as_ref() else {
+            return Ok(());
+        };
+        let binding_entries = self
+            .binding_sequence_index
+            .values()
+            .chain(self.binding_feature_atom_index.values())
+            .chain(self.binding_feature_pair_index.values())
+            .chain(self.binding_motif_index.values())
+            .map(Vec::len)
+            .sum::<usize>();
+        let fingerprint_entries = self
+            .lifetime_recurrences
+            .len()
+            .saturating_add(self.tentative_promoted.len())
+            .saturating_add(self.promoted_fingerprints.len());
+        if binding_entries == 0 && fingerprint_entries == 0 {
+            return Ok(());
+        }
+        let directory = file
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        if binding_entries > 0 {
+            // Binding routes are point-looked-up by their complete key and
+            // never prefix-scanned. Persist a full BLAKE3 digest once per
+            // posting instead of repeating arbitrarily long atom sequences.
+            // Fingerprint state remains in a separate full-key generation
+            // below because maintenance scans those records by prefix.
+            let mut builder = crate::store::posting_index::PostingIndexBuilder::create_hashed(
+                &directory,
+                self.binding_pool_id,
+                binding_entries as u64,
+            )?;
+            // The overlay holds each sequence route as the digest the index
+            // is keyed by, so the record goes out without rebuilding (or
+            // retaining) the atom sequence it was derived from.
+            for (digest, ids) in &self.binding_sequence_index {
+                for id in ids {
+                    builder.insert_digest(digest, *id)?;
+                }
+            }
+            for ((pool, neuron), ids) in &self.binding_feature_atom_index {
+                let key = BindingPostingKey::Feature(*pool, *neuron).encode();
+                for id in ids {
+                    builder.insert(&key, *id)?;
+                }
+            }
+            for ((pool, left, right), ids) in &self.binding_feature_pair_index {
+                let key = BindingPostingKey::FeaturePair(*pool, *left, *right).encode();
+                for id in ids {
+                    builder.insert(&key, *id)?;
+                }
+            }
+            for ((pool, motif), ids) in &self.binding_motif_index {
+                let key = BindingPostingKey::Motif(*pool, *motif).encode();
+                for id in ids {
+                    builder.insert(&key, *id)?;
+                }
+            }
+            let reference = builder.finish(file, self.binding_pool_id)?;
+            self.binding_posting_indexes.push(reference);
+        }
+
+        if fingerprint_entries > 0 {
+            let expected = fingerprint_entries.saturating_add(5);
+            let mut builder = crate::store::posting_index::PostingIndexBuilder::create_hashed(
+                &directory,
+                self.binding_pool_id,
+                expected as u64,
+            )?;
+            builder.insert(FINGERPRINT_STATE_MARKER_KEY, 1)?;
+            // New split generations carry an explicit discriminator. Legacy
+            // W1ZPOST1 generations lack it because they combine binding
+            // routes and fingerprint state and therefore remain visible to
+            // both runtime indexes after restore.
+            builder.insert(FINGERPRINT_ONLY_GENERATION_KEY, 1)?;
+            builder.insert(FINGERPRINT_HASHED_SCALAR_GENERATION_KEY, 1)?;
+            builder.insert(
+                FINGERPRINT_TENTATIVE_COUNT_KEY,
+                u32::try_from(self.tentative_binding_count_total).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "tentative binding count exceeds u32",
+                    )
+                })?,
+            )?;
+            builder.insert(
+                FINGERPRINT_PROMOTED_COUNT_KEY,
+                u32::try_from(self.consolidated_binding_count_total).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "consolidated binding count exceeds u32",
+                    )
+                })?,
+            )?;
+            for (fingerprint, count) in &self.lifetime_recurrences {
+                builder.insert(
+                    &encode_fingerprint_posting_key(
+                        FINGERPRINT_LIFETIME_KEY,
+                        &fingerprint.pairs(),
+                        &fingerprint.ordered_per_pool,
+                    ),
+                    *count,
+                )?;
+            }
+            for (fingerprint, id) in &self.tentative_promoted {
+                builder.insert(
+                    &encode_fingerprint_posting_key(
+                        FINGERPRINT_TENTATIVE_KEY,
+                        &fingerprint.pairs(),
+                        &fingerprint.ordered_per_pool,
+                    ),
+                    *id,
+                )?;
+            }
+            for (fingerprint, id) in &self.promoted_fingerprints {
+                builder.insert(
+                    &encode_fingerprint_posting_key(
+                        FINGERPRINT_PROMOTED_KEY,
+                        &fingerprint.pairs(),
+                        &fingerprint.ordered_per_pool,
+                    ),
+                    *id,
+                )?;
+            }
+            let reference = builder.finish(file, self.binding_pool_id)?;
+            self.fingerprint_posting_indexes.push(reference);
+
+            // Scalar recurrence/promotion state is point-looked-up and can be
+            // stored by full digest. Maintenance enumeration needs the full
+            // fingerprint only when no binding exists yet. Promoted direct-
+            // pretrain episodes therefore avoid repeating their long atom
+            // sequence in both lifetime and promotion records.
+            let unresolved_count = self
+                .lifetime_recurrences
+                .keys()
+                .filter(|fingerprint| {
+                    self.tentative_binding_id(fingerprint).is_none()
+                        && self.promoted_binding_id(fingerprint).is_none()
+                })
+                .count();
+            if unresolved_count > 0 {
+                let mut candidates = crate::store::posting_index::PostingIndexBuilder::create(
+                    &directory,
+                    self.binding_pool_id,
+                    unresolved_count.saturating_add(1) as u64,
+                )?;
+                candidates.insert(FINGERPRINT_CANDIDATE_GENERATION_KEY, 1)?;
+                for (fingerprint, count) in &self.lifetime_recurrences {
+                    if self.tentative_binding_id(fingerprint).is_some()
+                        || self.promoted_binding_id(fingerprint).is_some()
+                    {
+                        continue;
+                    }
+                    candidates.insert(
+                        &encode_fingerprint_posting_key(
+                            FINGERPRINT_LIFETIME_KEY,
+                            &fingerprint.pairs(),
+                            &fingerprint.ordered_per_pool,
+                        ),
+                        *count,
+                    )?;
+                }
+                let reference = candidates.finish(file, self.binding_pool_id)?;
+                self.fingerprint_candidate_indexes.push(reference);
+            }
+        }
+        self.binding_sequence_index.clear();
+        self.binding_feature_atom_index.clear();
+        self.binding_feature_pair_index.clear();
+        self.binding_motif_index.clear();
+        self.lifetime_recurrences.clear();
+        self.tentative_promoted.clear();
+        self.promoted_fingerprints.clear();
+        Ok(())
+    }
+
+    fn rebuild_binding_sequence_index(&mut self) {
+        self.binding_sequence_index.clear();
+        self.binding_feature_atom_index.clear();
+        self.binding_feature_pair_index.clear();
+        self.binding_motif_index.clear();
+        let Some(binding_pool) = self.fabric.pool(self.binding_pool_id) else {
+            return;
+        };
+        let bindings: Vec<(NeuronId, Vec<NeuronRef>)> = binding_pool
+            .read()
+            .iter_neurons()
+            .filter(|n| !n.is_atom())
+            .map(|n| (n.id, n.members.clone()))
+            .collect();
+        for (id, members) in bindings {
+            self.index_binding_members(id, &members);
+        }
+    }
+
+    /// Rebuild the derived binding lookup indexes while keeping neuron
+    /// payload memory proportional to one binding tree rather than the whole
+    /// brain. This is used after streaming conversion of legacy checkpoints,
+    /// whose positional format predates these derived indexes.
+    pub fn rebuild_binding_indexes_bounded(&mut self) -> std::io::Result<usize> {
+        self.binding_sequence_index.clear();
+        self.binding_feature_atom_index.clear();
+        self.binding_feature_pair_index.clear();
+        self.binding_motif_index.clear();
+        for pool_id in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pool_id) {
+                pool.write().rebuild_concept_indexes_bounded()?;
+            }
+        }
+        let Some(binding_pool) = self.fabric.pool(self.binding_pool_id) else {
+            return Ok(0);
+        };
+        let binding_slots = binding_pool.read().neuron_count();
+        let file = self.wbrain_file.as_ref().cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bounded binding rebuild requires a .wbrain container",
+            )
+        })?;
+        let directory = file
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let index_scope = file
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("brain.wbrain")
+            .to_owned();
+        let (mut builder, resume_binding) =
+            match crate::store::posting_index::PostingIndexBuilder::resume_latest(
+                &directory,
+                self.binding_pool_id,
+                &index_scope,
+            )? {
+                Some(resumed) => resumed,
+                None => (
+                    crate::store::posting_index::PostingIndexBuilder::create_scoped_hashed(
+                        &directory,
+                        self.binding_pool_id,
+                        (binding_slots as u64).saturating_mul(16),
+                        &index_scope,
+                    )?,
+                    None,
+                ),
+            };
+        // A process can stop after any posting belonging to a binding. Replay
+        // that whole binding: duplicate adjacent values are removed by lookup,
+        // while every posting that had not yet reached disk is restored.
+        let first_binding = resume_binding.map_or(0, |id| id as usize);
+        let mut rebuilt = 0;
+        for raw_id in first_binding..binding_slots {
+            let binding_id = raw_id as NeuronId;
+            if !binding_pool.read().is_concept_slot(binding_id) {
+                continue;
+            }
+            rebuilt += 1;
+            // Finalization needs only the binding's topology. Read that
+            // prefix directly from the serialized neuron record so a large
+            // terminal payload never enters the working set.
+            let members = binding_pool
+                .write()
+                .read_neuron_shape_bounded(binding_id)?
+                .map(|(_, members, _)| members)
+                .unwrap_or_default();
+            self.stream_binding_posting_keys_bounded(&members, binding_id, &mut builder)?;
+        }
+        let reference = builder.finish(&file, self.binding_pool_id)?;
+        // Replace only derived binding routes. Fingerprint recurrence
+        // generations are independent causal state and remain untouched.
+        self.binding_posting_indexes.clear();
+        self.binding_posting_indexes.push(reference);
+        Ok(rebuilt)
+    }
+
+    /// Raw read of a pool's current activation map.  No interpretation,
+    /// no grounding — just the substrate state.  Spec §1.6.
+    pub fn read_activation(&self, pool_id: PoolId) -> AHashMap<NeuronId, f32> {
+        let pool = match self.fabric.pool(pool_id) {
+            Some(p) => p,
+            None => return AHashMap::new(),
+        };
+        let p = pool.read();
+        let mut out = AHashMap::new();
+        for nid in p.currently_firing() {
+            out.insert(nid, p.activation(nid));
+        }
+        out
+    }
+
+    fn goal_paged_binding_routes(&self, query: &Pool, sequence: &[NeuronId]) -> Vec<NeuronId> {
+        let mut seen_atoms = ahash::AHashSet::new();
+        let mut current: Option<Vec<NeuronId>> = None;
+        for &neuron_id in sequence {
+            if !seen_atoms.insert(neuron_id) {
+                continue;
+            }
+            let mut routes = query.binding_routes_from(neuron_id, self.binding_pool_id);
+            if routes.is_empty() {
+                if current.is_some() {
+                    break;
+                }
+                continue;
+            }
+            if !routes.is_sorted() {
+                routes.sort_unstable();
+            }
+            match &mut current {
+                None => {
+                    current = Some(routes);
+                }
+                Some(active) => {
+                    let next: Vec<NeuronId> = active
+                        .iter()
+                        .copied()
+                        .filter(|id| routes.binary_search(id).is_ok())
+                        .collect();
+                    if next.is_empty() {
+                        break;
+                    }
+                    *active = next;
+                }
+            }
+        }
+        current.unwrap_or_default()
+    }
+
+    /// Resolve only bindings reachable from the current query state.
+    ///
+    /// Exact ordered-sequence postings preserve directly trained episodes,
+    /// feature-atom postings cover structural/paraphrased matches, and live
+    /// member terminals preserve concept-layer routes. An empty result is an
+    /// honest OOV result; inference must never turn it into a whole binding
+    /// pool scan.
+    fn routed_binding_candidates(
+        &self,
+        query_pool: PoolId,
+        target_pool: Option<PoolId>,
+    ) -> Vec<NeuronId> {
+        let Some(query_handle) = self.fabric.pool(query_pool) else {
+            return Vec::new();
+        };
+        let (firing, sequence, terminal_routes, goal_routes) = {
+            let query = query_handle.read();
+            let firing: Vec<NeuronId> = query.currently_firing().collect();
+            let mut terminal_routes = Vec::new();
+            for neuron_id in &firing {
+                if let Some(neuron) = query.get(*neuron_id) {
+                    terminal_routes.extend(
+                        neuron
+                            .terminals
+                            .iter()
+                            .filter(|terminal| terminal.target.pool == self.binding_pool_id)
+                            .map(|terminal| terminal.target.neuron),
+                    );
+                }
+            }
+            let sequence = query.last_observed_sequence().to_vec();
+            let goal_routes = self.goal_paged_binding_routes(&query, &sequence);
+            (firing, sequence, terminal_routes, goal_routes)
+        };
+
+        let mut candidates = AHashMap::new();
+        add_binding_evidence(&mut candidates, terminal_routes);
+        for neuron_id in firing {
+            add_binding_evidence(
+                &mut candidates,
+                self.binding_feature_postings(query_pool, neuron_id),
+            );
+        }
+        if !goal_routes.is_empty() {
+            let boost: u16 = if goal_routes.len() <= MAX_ROUTED_BINDING_CANDIDATES {
+                16
+            } else {
+                1
+            };
+            for id in goal_routes {
+                let score = candidates.entry(id).or_insert(0);
+                *score = score.saturating_add(boost);
+            }
+        }
+        let exact = match target_pool.filter(|_| !sequence.is_empty()) {
+            Some(target_pool) => {
+                self.binding_sequence_postings(query_pool, target_pool, &sequence)
+            }
+            None => Vec::new(),
+        };
+        add_binding_evidence(&mut candidates, exact.iter().copied());
+
+        let mut ids = rank_bounded_binding_evidence(
+            candidates,
+            MAX_ROUTED_BINDING_CANDIDATES,
+        );
+        // Exact ordered sensory identity is authoritative, so it may not be
+        // OUTVOTED out of the candidate set by fuzzy per-byte evidence.
+        //
+        // `rank_bounded_binding_evidence` sorts on how many firing atoms voted
+        // for a binding and truncates to the cap, breaking ties by id
+        // descending -- newest first. A binding that every feature posting has
+        // dropped arrives here with exactly one vote, from this route, and
+        // loses both the sort and the tie-break. Measured off
+        // `logs/scorecard-latest.json` 2026-10-01: at scale 64 every one of
+        // 1,095,061 feature lookups came back FULL, so one vote is the normal
+        // case there rather than the exception, and merely CONSULTING the
+        // exact route moved scale-64 integration only 38.54 -> 39.00.
+        //
+        // The bound is preserved: the output is still at most
+        // `MAX_ROUTED_BINDING_CANDIDATES`, so this buys reach without buying
+        // latency or resident candidate bodies. It cannot invent an answer
+        // either -- an exact-sequence posting is the binding whose query atoms
+        // were observed in THIS order, and the scoring below is unchanged.
+        if !exact.is_empty() {
+            let present: ahash::AHashSet<NeuronId> = ids.iter().copied().collect();
+            let missing: Vec<NeuronId> = exact
+                .iter()
+                .copied()
+                .filter(|id| !present.contains(id))
+                .take(MAX_ROUTED_BINDING_CANDIDATES)
+                .collect();
+            if !missing.is_empty() {
+                ids.truncate(MAX_ROUTED_BINDING_CANDIDATES - missing.len());
+                ids.extend(missing);
+            }
+        }
+        if let Some(binding_handle) = self.fabric.pool(self.binding_pool_id) {
+            let mut bindings = binding_handle.write();
+            ids.retain(|binding_id| match bindings.ensure_loaded(*binding_id) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        "binding page-in failed for routed neuron {}: {}",
+                        binding_id,
+                        error
+                    );
+                    false
+                }
+            });
+        } else {
+            ids.clear();
+        }
+        ids
+    }
+
+    /// Produce an [`AnswerWithGrounding`] by propagating from
+    /// `query_pool`'s currently-firing state and reading the resulting
+    /// activation in `target_pool`.  Every output carries a
+    /// Recursively compute the depth of a concept neuron: atoms are
+    /// depth 0; concepts whose members are all atoms are depth 1;
+    /// concepts whose members include concepts of depth N are depth
+    /// N+1.  Used by [`Self::integrate_concept_first`] to pick the
+    /// DEEPEST firing concept — the substrate's "highest layer that
+    /// matches the input" per ARCHITECTURE.md §4.D.1.
+    pub fn concept_depth(&self, pool_id: PoolId, nid: NeuronId) -> usize {
+        let p = match self.fabric.pool(pool_id) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let p_read = p.read();
+        let n = match p_read.get(nid) {
+            Some(n) => n,
+            None => return 0,
+        };
+        if n.is_atom() {
+            return 0;
+        }
+        let mut max_d = 0;
+        for m in &n.members {
+            if m.pool != pool_id {
+                continue;
+            }
+            let d = self.concept_depth_inner(&p_read, m.neuron, 0, 16);
+            if d > max_d {
+                max_d = d;
+            }
+        }
+        max_d + 1
+    }
+
+    fn concept_depth_inner(
+        &self,
+        p: &crate::pool::Pool,
+        nid: NeuronId,
+        current: usize,
+        cap: usize,
+    ) -> usize {
+        if current >= cap {
+            return current;
+        }
+        let n = match p.get(nid) {
+            Some(n) => n,
+            None => return current,
+        };
+        if n.is_atom() {
+            return current;
+        }
+        let mut max_d = current;
+        for m in &n.members {
+            if m.pool != p.id() {
+                continue;
+            }
+            let d = self.concept_depth_inner(p, m.neuron, current + 1, cap);
+            if d > max_d {
+                max_d = d;
+            }
+        }
+        max_d
+    }
+
+    /// Concept-first retrieval — the user's "always look at the
+    /// deepest level we see" inference contract from ARCHITECTURE.md
+    /// §4.D.1.
+    ///
+    /// 1. Propagate from query_pool across the fabric using the
+    ///    substrate's existing axon/dendrite wiring (no scoring
+    ///    formula — just Hebbian terminals doing their job).
+    /// 2. In target_pool, find the DEEPEST emerged concept neuron
+    ///    with non-trivial activation.  That concept's hierarchical
+    ///    depth tells us it represents the highest-layer match the
+    ///    substrate has crystallised for this input.
+    /// 3. Decode it via decode_concept_members and return.
+    ///
+    /// Falls back to atom-level reassembly only when NO concept in
+    /// target_pool reaches the activation floor.  Trained-input
+    /// retrieval should hit deterministic 100% via this path because
+    /// the cross-pool axon between trained query-concept and trained
+    /// target-concept lights up the target deterministically.
+    ///
+    /// Parallel to [`Self::integrate`] — does NOT touch its scoring
+    /// formula or downstream consumers.
+    pub fn integrate_concept_first(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+    ) -> Option<Vec<u8>> {
+        let propagated = self.fabric.propagate(query_pool);
+        let target_acts = propagated.get(&target_pool)?;
+        if target_acts.is_empty() {
+            return None;
+        }
+
+        let pool_handle = self.fabric.pool(target_pool)?;
+        let p = pool_handle.read();
+
+        const ACTIVATION_FLOOR: f32 = 0.001;
+        // Runaway-emergence concepts are rejected by `decode_is_runaway_tiling`
+        // on periodicity alone. The former 24-byte cap assumed every trained
+        // answer was a category word and silently truncated the substrate to
+        // fragments once it was trained on whole source files.
+
+        // Score concepts by AVG-MEMBER-ACTIVATION (the same signal
+        // /integrate's Stage 6 selection uses): the concept whose
+        // members ALL fire strongly is the one whose pattern was
+        // actually triggered by the cross-pool propagation.  A
+        // concept whose members partly fire (because it includes
+        // extra atoms from unrelated words) gets a lower score.
+        //
+        // Tiebreak by concept depth (deeper hierarchy wins).
+        //
+        // The sanity filter rejects a decode that is mostly one repeated
+        // block, which is what runaway emergence actually produces. Length
+        // is deliberately not a criterion.
+        let mut best: Option<(NeuronId, Vec<u8>, f32, usize)> = None;
+        for (nid, _act) in target_acts.iter() {
+            let n = match p.get(*nid) {
+                Some(n) => n,
+                None => continue,
+            };
+            if n.is_atom() {
+                continue;
+            }
+            // Compute avg member activation in target pool.
+            let in_pool_members: Vec<NeuronId> = n
+                .members
+                .iter()
+                .filter(|m| m.pool == target_pool)
+                .map(|m| m.neuron)
+                .collect();
+            if in_pool_members.is_empty() {
+                continue;
+            }
+            let member_sum: f32 = in_pool_members
+                .iter()
+                .map(|mid| target_acts.get(mid).copied().unwrap_or(0.0))
+                .sum();
+            let avg_member_act = member_sum / in_pool_members.len() as f32;
+            if avg_member_act < ACTIVATION_FLOOR {
+                continue;
+            }
+            // Decode + sanity filters.
+            let decoded = p.decode_concept_members(&n.members);
+            if decoded.is_empty() || decode_is_runaway_tiling(&decoded) {
+                continue;
+            }
+            let depth = {
+                let mut max_d = 0;
+                for m in &n.members {
+                    if m.pool != target_pool {
+                        continue;
+                    }
+                    let d = self.concept_depth_inner(&p, m.neuron, 0, 16);
+                    if d > max_d {
+                        max_d = d;
+                    }
+                }
+                max_d + 1
+            };
+            // Score = avg_member_activation × sqrt(member_count).
+            // The √len factor rewards longer concepts when their
+            // member activation pattern is well-covered.  Pure short
+            // morphemes ('ala', 'oo') get a small √2-√3 boost, but
+            // a fully-activated word-level concept ('animal' = √6)
+            // wins decisively over morpheme fragments.
+            let length_factor = (in_pool_members.len() as f32).sqrt();
+            let score = avg_member_act * length_factor;
+            match &best {
+                None => best = Some((*nid, decoded, score, depth)),
+                Some((_, _, prev_score, prev_depth)) => {
+                    if score > *prev_score || (score == *prev_score && depth > *prev_depth) {
+                        best = Some((*nid, decoded, score, depth));
+                    }
+                }
+            }
+        }
+
+        match best {
+            Some((_nid, decoded, _score, _depth)) => Some(decoded),
+            None => {
+                // No concept fired — fall back to atom-level
+                // reassembly.  Walk firing target atoms in
+                // descending activation order and emit their bytes.
+                let mut atom_acts: Vec<(NeuronId, f32)> = target_acts
+                    .iter()
+                    .filter(|(nid, _)| p.get(**nid).map_or(false, |n| n.is_atom()))
+                    .filter(|(_, a)| **a >= ACTIVATION_FLOOR)
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
+                if atom_acts.is_empty() {
+                    return None;
+                }
+                atom_acts
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut out = Vec::new();
+                for (nid, _) in atom_acts.iter().take(32) {
+                    if let Some(n) = p.get(*nid) {
+                        out.extend(p.encoding_reassemble(&[(n.label.as_str(), 1.0)]));
+                    }
+                }
+                if out.is_empty() { None } else { Some(out) }
+            }
+        }
+    }
+
+    /// [`GroundingReport`] per spec §2.7.
+    ///
+    /// The brain doesn't decide whether to surface uncertainty —
+    /// uncertainty is always surfaced.  Caller reads the report.
+    pub fn integrate(&self, query_pool: PoolId, target_pool: PoolId) -> AnswerWithGrounding {
+        // 1. Propagate from query pool across the fabric.
+        let propagated = self.fabric.propagate(query_pool);
+
+        // 2. Input atom coverage in the query pool: how many of the
+        // currently-firing neurons there map to known atoms.  At this
+        // phase every fired neuron is by construction in `label_to_id`,
+        // so coverage is 1.0 if anything fired and 0 otherwise.  Once
+        // sensor adapters route unknown bytes through atom birth this
+        // remains 1.0 for known input, with adaptive plasticity per
+        // spec §2.5 handling the novelty signal at the concept layer.
+        let query_pool_handle = match self.fabric.pool(query_pool) {
+            Some(p) => p,
+            None => {
+                return AnswerWithGrounding::unknown(
+                    format!("unknown pool id {}", query_pool),
+                    target_pool,
+                );
+            }
+        };
+        let fired_in_query = query_pool_handle
+            .read()
+            .currently_firing()
+            .collect::<Vec<_>>();
+        if fired_in_query.is_empty() {
+            return AnswerWithGrounding::unknown(
+                "no input observed in query pool — cannot integrate",
+                target_pool,
+            );
+        }
+        let input_atom_coverage = 1.0_f32;
+
+        // 3. Read target pool activation from propagation results.
+        let empty: AHashMap<NeuronId, f32> = AHashMap::new();
+        let target_activation = propagated.get(&target_pool).unwrap_or(&empty);
+
+        // 4. Compute Jaccard between the strongest target concept's
+        // member-atom set (within the same target pool only) and the
+        // input atoms.  Internal use only — spec §1.6 says no Jaccard
+        // ranker exposed at the API surface; here it's a measurement
+        // for the grounding report, not a selection mechanism.
+        let target_pool_handle = match self.fabric.pool(target_pool) {
+            Some(p) => p,
+            None => {
+                return AnswerWithGrounding::unknown(
+                    format!("unknown target pool id {}", target_pool),
+                    target_pool,
+                );
+            }
+        };
+        let target = target_pool_handle.read();
+
+        // Stage 3b (selection-side): build a set of target-pool
+        // concepts that are DIRECTLY targeted by a query-pool concept
+        // via Stage 3's concept→concept cross-pool terminal.  These
+        // are the specific binding partners the substrate identified
+        // during training; they get a score boost in selection so the
+        // density-based picker doesn't get drowned out by short,
+        // shared atom-level concepts ("00" beating "C000" etc.).
+        let directly_targeted: ahash::AHashSet<NeuronId> = {
+            let q = query_pool_handle.read();
+            let mut set = ahash::AHashSet::new();
+            for nid in q.currently_firing() {
+                if let Some(qn) = q.get(nid) {
+                    if qn.is_atom() {
+                        continue;
+                    }
+                    for t in &qn.terminals {
+                        if t.target.pool != target_pool {
+                            continue;
+                        }
+                        if let Some(tn) = target.get(t.target.neuron) {
+                            if !tn.is_atom() {
+                                set.insert(t.target.neuron);
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        };
+
+        // Phase B: the LOCKED variant of directly_targeted — target
+        // concepts the query reaches through high-consolidation
+        // (decay-exempt) cross-pool terminals.  These are the canonical
+        // trained bindings; their score must dominate atom-soup
+        // byproducts (concepts that share some member atoms but were
+        // never trained as the actual response).
+        //
+        // The signal is structural: a terminal whose consolidation has
+        // crossed CONSOLIDATION_LOCK has been reinforced on at least
+        // that many distinct ticks — the brain's own evidence that
+        // this is a trained pairing, not a random co-firing.  Selection
+        // boost is 16× so a single locked path slams the canonical
+        // answer into first place over any number of atom-overlap
+        // concepts at equivalent avg_member_act.
+        let locked_targeted: ahash::AHashSet<NeuronId> = {
+            let q = query_pool_handle.read();
+            let mut set = ahash::AHashSet::new();
+            for nid in q.currently_firing() {
+                if let Some(qn) = q.get(nid) {
+                    for t in &qn.terminals {
+                        if t.target.pool != target_pool {
+                            continue;
+                        }
+                        if t.consolidation < crate::neuron::Neuron::CONSOLIDATION_LOCK {
+                            continue;
+                        }
+                        if let Some(tn) = target.get(t.target.neuron) {
+                            if !tn.is_atom() {
+                                set.insert(t.target.neuron);
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        };
+
+        // Stage 7 (binding-pool routing): find the binding concept
+        // whose QUERY-POOL member atoms BEST MATCH the currently-firing
+        // query atom set.  Its target-pool member atoms then form a
+        // strong hint for which action concept the substrate associated
+        // with this prompt during training.
+        //
+        // We rank bindings by precision × recall over query atoms
+        // rather than raw activation — raw activation favors bindings
+        // with more total atoms (more activation paths in propagation),
+        // which is the wrong signal.  We want the binding whose
+        // text-pool member set IS the query's firing set.
+        // Phase B v2 — also remember the binding NEURON id and its
+        // match score, not just the atom set, so we can read the
+        // canonical response sequence directly from the binding's
+        // target-pool members (in firing order) when the match is
+        // exact and the binding is trained.
+        let (binding_id_opt, binding_score, binding_target_atoms): (
+            Option<NeuronId>,
+            f32,
+            ahash::AHashSet<NeuronId>,
+        ) = {
+            let bpid = self.binding_pool_id;
+            if bpid == target_pool || bpid == query_pool {
+                (None, 0.0, ahash::AHashSet::new())
+            } else {
+                let q_atoms: ahash::AHashSet<NeuronId> = {
+                    let q = query_pool_handle.read();
+                    q.currently_firing()
+                        .filter(|nid| q.get(*nid).map_or(false, |n| n.is_atom()))
+                        .collect()
+                };
+                if q_atoms.is_empty() {
+                    (None, 0.0, ahash::AHashSet::new())
+                } else if let Some(bp) = self.fabric.pool(bpid) {
+                    let candidate_ids =
+                        self.routed_binding_candidates(query_pool, Some(target_pool));
+                    let bp_read = bp.read();
+                    let mut best: Option<(NeuronId, f32)> = None;
+                    for n in candidate_ids
+                        .iter()
+                        .filter_map(|binding_id| bp_read.get(*binding_id))
+                    {
+                        if n.is_atom() {
+                            continue;
+                        }
+                        let bind_query: ahash::AHashSet<NeuronId> = n
+                            .members
+                            .iter()
+                            .filter(|m| m.pool == query_pool)
+                            .map(|m| m.neuron)
+                            .collect();
+                        let bind_target_has = n.members.iter().any(|m| m.pool == target_pool);
+                        if bind_query.is_empty() || !bind_target_has {
+                            continue;
+                        }
+                        let intersect =
+                            bind_query.iter().filter(|a| q_atoms.contains(a)).count() as f32;
+                        let precision = intersect / bind_query.len() as f32;
+                        let recall = intersect / q_atoms.len() as f32;
+                        let score = precision * recall;
+                        if score > 0.0 && best.map_or(true, |(_, s)| score > s) {
+                            best = Some((n.id, score));
+                        }
+                    }
+                    match best {
+                        Some((bnid, sc)) => {
+                            let atoms = if let Some(n) = bp_read.get(bnid) {
+                                n.members
+                                    .iter()
+                                    .filter(|m| m.pool == target_pool)
+                                    .map(|m| m.neuron)
+                                    .collect()
+                            } else {
+                                ahash::AHashSet::new()
+                            };
+                            (Some(bnid), sc, atoms)
+                        }
+                        None => (None, 0.0, ahash::AHashSet::new()),
+                    }
+                } else {
+                    (None, 0.0, ahash::AHashSet::new())
+                }
+            }
+        };
+
+        // Phase B v2 — exact-binding shortcut: if a binding neuron
+        // matches the query at near-perfect precision×recall (>= 0.95)
+        // AND has been used at least twice (use_count > 1, i.e. the
+        // trained pathway), emit ITS target-pool member subsequence
+        // directly in FIRING ORDER.  This bypasses the target-concept
+        // selector entirely — the binding IS the canonical
+        // prompt→response record from training, and reading its
+        // ordered target members reproduces the trained answer
+        // bit-for-bit.
+        //
+        // The score gate (0.95) lets near-anagram matches (e.g.
+        // adding a single trailing space) still hit; the use_count
+        // gate ensures we don't read a one-off binding that hasn't
+        // been validated by repeated co-firing.  The "answer" wraps
+        // the binding's ordered atom-leaf decode so callers don't
+        // need to know about the bypass — it's still an
+        // AnswerWithGrounding.
+        if binding_score >= 0.95 {
+            if let Some(bnid) = binding_id_opt {
+                if let Some(bp) = self.fabric.pool(self.binding_pool_id) {
+                    let bp_read = bp.read();
+                    let (use_count, target_members): (u64, Vec<NeuronRef>) = match bp_read.get(bnid)
+                    {
+                        Some(n) => (
+                            n.use_count,
+                            n.members
+                                .iter()
+                                .filter(|m| m.pool == target_pool)
+                                .copied()
+                                .collect(),
+                        ),
+                        None => (0, Vec::new()),
+                    };
+                    drop(bp_read);
+                    if use_count >= 2 && !target_members.is_empty() {
+                        let decoded = target.decode_concept_members(&target_members);
+                        if !decoded.is_empty() {
+                            return AnswerWithGrounding {
+                                answer: Some(decoded),
+                                grounding: GroundingReport {
+                                    input_atom_coverage,
+                                    strongest_match: Some(NeuronRef::new(
+                                        self.binding_pool_id,
+                                        bnid,
+                                    )),
+                                    strongest_match_jaccard: binding_score,
+                                    composition_used: Vec::new(),
+                                    fabric_confidence: binding_score,
+                                    eem_confidence: None,
+                                    annealer_confidence: None,
+                                    integrated_confidence: binding_score,
+                                    outside_grounding: false,
+                                    // Cross-pool composition is by
+                                    // definition speculative (spec
+                                    // §2.3): the answer came from a
+                                    // binding-pool concept whose
+                                    // members span more than one
+                                    // pool, not from a direct retrieve
+                                    // of a single trained pair.
+                                    speculation_flag: query_pool != target_pool,
+                                    peer_contributions: Vec::new(),
+                                },
+                                confidence_tier: ConfidenceTier::from_confidence(
+                                    binding_score,
+                                    false,
+                                    false,
+                                ),
+                                next_steps_if_ungrounded: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Selection (Stage 6 — coverage-aware density):
+        //
+        //   score = avg_member_activation
+        //         × pathway_boost
+        //         × sqrt(direct_member_count)
+        //         × unique_ratio
+        //
+        // where:
+        //   avg_member_activation = mean of target_activation across the
+        //                           concept's in-pool member neurons.
+        //                           High when ALL members of the concept
+        //                           are firing strongly — i.e., the
+        //                           concept's full pattern is present.
+        //   sqrt(direct_member_count) — rewards longer concepts when
+        //                           coverage is good (so "color" wins
+        //                           over "co" when all of c,o,l,r are
+        //                           active), without letting concepts
+        //                           with 20+ repetitions dominate (sqrt
+        //                           grows slowly).
+        //   unique_ratio = unique_member_ids / direct_member_count.
+        //                  Penalizes concepts with REPEATED members —
+        //                  the long-pattern concepts from Experiment A
+        //                  (4× "x+y}" pattern) have unique_ratio 0.25
+        //                  while clean concepts have 1.0.
+        //   pathway_boost — same 4× factor as before for concepts that
+        //                  a query-pool concept directly targets via
+        //                  Stage 3 concept→concept cross-pool wiring.
+        //
+        // This replaces the earlier `(act × boost) / expanded_size`
+        // density rule, which favored short concepts so aggressively
+        // that trained full-word responses lost to 2-byte prefix
+        // concepts during chat retrieval.
+        let pathway_boost = 4.0_f32;
+        let mut strongest: Option<(NeuronRef, f32)> = None;
+        let mut best_score: f32 = f32::NEG_INFINITY;
+        let mut all_active_concepts: Vec<NeuronRef> = Vec::new();
+        for (&nid, &act) in target_activation.iter() {
+            if act < 0.001 {
+                continue;
+            }
+            if let Some(n) = target.get(nid) {
+                if !n.is_atom() {
+                    let r = NeuronRef::new(target_pool, nid);
+                    all_active_concepts.push(r);
+
+                    let in_pool_members: Vec<NeuronId> = n
+                        .members
+                        .iter()
+                        .filter(|m| m.pool == target_pool)
+                        .map(|m| m.neuron)
+                        .collect();
+                    let member_count = in_pool_members.len().max(1);
+                    let unique_count: usize = in_pool_members
+                        .iter()
+                        .collect::<ahash::AHashSet<_>>()
+                        .len()
+                        .max(1);
+                    let member_activation_sum: f32 = in_pool_members
+                        .iter()
+                        .map(|nid| target_activation.get(nid).copied().unwrap_or(0.0))
+                        .sum();
+                    let avg_member_act = member_activation_sum / member_count as f32;
+
+                    let boost = if directly_targeted.contains(&nid) {
+                        pathway_boost
+                    } else {
+                        1.0
+                    };
+                    let length_factor = (member_count as f32).sqrt();
+
+                    // Information factor: rewards unique-atom count
+                    // while penalizing pure repetition.  Linear ratio
+                    // was too punitive on small repetitions like
+                    // "animal" (one repeated 'a') vs "nimal" (no
+                    // repetition).  This form gives "animal" a slight
+                    // edge over "nimal" because of its extra atom,
+                    // while still strongly penalizing concepts that
+                    // are mostly repetition (4× "x+y}" loses to
+                    // "x+y}").
+                    //
+                    //   info = unique_count - 0.3 × (member_count - unique_count)
+                    //
+                    // For 4-unique-of-4: info = 4
+                    // For 4-unique-of-8: info = 4 - 0.3*4 = 2.8
+                    // For 4-unique-of-16: info = 4 - 0.3*12 = 0.4
+                    // For 6-unique-of-7 (vehicle): info = 6 - 0.3 = 5.7
+                    // For 5-unique-of-6 (animal): info = 5 - 0.3 = 4.7
+                    // For 5-unique-of-5 (nimal): info = 5
+                    let repetition = (member_count - unique_count) as f32;
+                    let info_factor = (unique_count as f32 - 0.3 * repetition).max(0.1);
+
+                    // Stage 7 binding-pool routing boost.  If the
+                    // strongest active binding's target-pool atoms are
+                    // a subset of (or close match to) this candidate
+                    // concept's member-atom set, boost it.  This routes
+                    // selection through the pair-specific binding
+                    // structure the substrate built during training.
+                    let binding_boost = if !binding_target_atoms.is_empty() {
+                        let in_pool_member_set: ahash::AHashSet<NeuronId> =
+                            in_pool_members.iter().copied().collect();
+                        let matched = binding_target_atoms
+                            .iter()
+                            .filter(|a| in_pool_member_set.contains(a))
+                            .count() as f32;
+                        let coverage_of_binding = matched / binding_target_atoms.len() as f32;
+                        if coverage_of_binding >= 0.99 {
+                            8.0
+                        } else if coverage_of_binding >= 0.75 {
+                            3.0
+                        } else if coverage_of_binding >= 0.5 {
+                            1.5
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    };
+
+                    let score =
+                        avg_member_act * boost * length_factor * info_factor * binding_boost;
+                    let _ = locked_targeted.contains(&nid); // signal retained for Phase B v2 below
+                    // Hold on to raw activation for grounding metric.
+                    let _ = act;
+                    let _ = target.expanded_size(&n.members);
+                    if score > best_score {
+                        best_score = score;
+                        strongest = Some((r, act));
+                    }
+                }
+            }
+        }
+
+        // Outside-grounding detection: nothing in the target pool was
+        // sufficiently activated.  Spec §2.2.
+        let (strongest_match, strongest_activation) = match strongest {
+            Some(x) => (Some(x.0), x.1),
+            None => {
+                return AnswerWithGrounding {
+                    answer: None,
+                    grounding: GroundingReport {
+                        input_atom_coverage,
+                        strongest_match: None,
+                        strongest_match_jaccard: 0.0,
+                        composition_used: all_active_concepts,
+                        fabric_confidence: 0.0,
+                        eem_confidence: None,
+                        annealer_confidence: None,
+                        integrated_confidence: 0.0,
+                        outside_grounding: true,
+                        speculation_flag: false,
+                        peer_contributions: Vec::new(),
+                    },
+                    confidence_tier: ConfidenceTier::Ungrounded,
+                    next_steps_if_ungrounded: vec![crate::grounding::RequestObservation {
+                        domain: "target pool has no activated concept for this input".into(),
+                        examples_needed: 1,
+                        why: "extend grounding by co-observing query and target streams together"
+                            .into(),
+                        pool: target_pool,
+                    }],
+                };
+            }
+        };
+
+        // Jaccard against the strongest match's member set (for the
+        // grounding report only).  Pure measurement, not a gate.
+        let strongest_jaccard = if let Some(r) = strongest_match {
+            let input_set: std::collections::HashSet<NeuronId> =
+                fired_in_query.iter().copied().collect();
+            // Member NeuronRefs may live in any pool.  We compare only
+            // those whose pool == query_pool — atoms in the target
+            // concept that originate from the query stream.
+            if let Some(n) = target.get(r.neuron) {
+                let concept_in_query: std::collections::HashSet<NeuronId> = n
+                    .members
+                    .iter()
+                    .filter(|m| m.pool == query_pool)
+                    .map(|m| m.neuron)
+                    .collect();
+                if input_set.is_empty() && concept_in_query.is_empty() {
+                    0.0
+                } else {
+                    let inter = input_set.intersection(&concept_in_query).count() as f32;
+                    let union = input_set.union(&concept_in_query).count().max(1) as f32;
+                    inter / union
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // Speculation flag: when the strongest match's members span
+        // multiple pools (binding concept) OR when the answer arrived
+        // via cross-pool propagation rather than direct input retrieval.
+        // The latter is detected here as "query_pool != target_pool":
+        // the activation reaching target_pool came through axon
+        // terminals, which is compositional by definition.
+        let speculation_flag = query_pool != target_pool
+            || strongest_match
+                .map(|r| {
+                    target
+                        .get(r.neuron)
+                        .map(|n| n.is_binding(target_pool))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+        // Fabric confidence = fraction of propagated activation
+        // captured by the strongest match (its share of total
+        // concept-level activation in the target pool).
+        let total_concept_act: f32 = target_activation
+            .iter()
+            .filter(|&(&nid, _)| target.get(nid).map_or(false, |n| !n.is_atom()))
+            .map(|(_, &a)| a)
+            .sum();
+        let fabric_confidence = if total_concept_act > 1e-9 {
+            (strongest_activation / total_concept_act).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Integrated confidence = fabric_confidence for now (EEM and
+        // annealer are not online until phases 5–6; their contribution
+        // weights stay implicitly zero).  Spec §4.D will combine all
+        // three once they're built.
+        let integrated_confidence = fabric_confidence;
+
+        // Decode the strongest match's members back through the target
+        // pool's encode/decode contract.  Uses the recursive walker so
+        // that a concept-of-concepts gets decoded all the way down to
+        // its atom leaves.  Spec §3.4.
+        let answer = strongest_match.and_then(|r| {
+            target
+                .get(r.neuron)
+                .map(|n| target.decode_concept_members(&n.members))
+        });
+
+        let outside_grounding = fabric_confidence < 0.01;
+        let confidence_tier = ConfidenceTier::from_confidence(
+            integrated_confidence,
+            outside_grounding,
+            speculation_flag,
+        );
+
+        AnswerWithGrounding {
+            answer,
+            grounding: GroundingReport {
+                input_atom_coverage,
+                strongest_match,
+                strongest_match_jaccard: strongest_jaccard,
+                composition_used: all_active_concepts,
+                fabric_confidence,
+                eem_confidence: None,
+                annealer_confidence: None,
+                integrated_confidence,
+                outside_grounding,
+                speculation_flag,
+                peer_contributions: Vec::new(),
+            },
+            confidence_tier,
+            next_steps_if_ungrounded: Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 8 — Critical-thinking loop (spec §4.D + §4.B + user's
+    // ivy-growth equation-chaining vision).
+    //
+    // The unbounded-problem-resolution path:
+    //   prompt
+    //     ↓
+    //   fabric retrieval (today's chat) ──→ if confident, return
+    //     ↓ low confidence
+    //   EEM chain explorer ──→ walk grounded facts across pools by
+    //                          composing them through shared concepts;
+    //                          look for convergence in the target pool
+    //     ↓ no convergence
+    //   RequestObservation ──→ honest "I need more knowledge"
+    //
+    // The annealer also plugs into the chain exploration step: when
+    // multiple chains exist with comparable confidence, the annealer's
+    // temporal prediction biases toward chains whose convergence
+    // members match patterns the substrate has previously seen.
+    // ---------------------------------------------------------------
+
+    /// Score the best matching binding for the query's firing atom set.
+    /// Returns (precision, recall) of the best binding's query-pool
+    /// member set against the actually-firing query atoms.  This is the
+    /// substrate's "do I have a trained pattern that matches this
+    /// prompt?" signal — used by `integrate_autonomous` to detect
+    /// out-of-vocabulary prompts and honestly report outside_grounding
+    /// rather than hallucinating an answer from accidentally-overlapping
+    /// atoms.
+    /// Atom-tier best-binding match — the legacy Stage 9 signature.
+    /// Kept for tests and external callers that don't need tier
+    /// awareness.  Internally now delegates to
+    /// [`Self::best_binding_match_v2`] and discards the tier tag.
+    pub fn best_binding_match(&self, query_pool: PoolId) -> (f32, f32) {
+        let m = self.best_binding_match_atom_tier(query_pool, None);
+        (m.precision, m.recall)
+    }
+
+    /// Stage 11 tier-aware best-binding match.  Tries concept-level
+    /// matching first; falls back to atom-level when either side has
+    /// fewer than one concept or fails the coverage gate.  Returns
+    /// the highest-scoring match across both tiers along with the
+    /// tier tag, so callers (notably `integrate_autonomous`) can
+    /// reason about whether the match is concept-grade.
+    ///
+    /// Coverage gate (concept tier only): the fraction of currently-
+    /// firing query-pool items that are concepts must be at least
+    /// 0.5.  Without this, a single concept lit by noise alongside
+    /// many loose atoms would falsely pass the gate at precision=1.0.
+    pub fn best_binding_match_v2(&self, query_pool: PoolId) -> BindingMatch {
+        self.best_binding_match_routed(query_pool, None)
+    }
+
+    /// [`Self::best_binding_match_v2`] with the EXACT ordered sensory route
+    /// available to candidate selection.
+    ///
+    /// Why the target pool is a parameter at all. `routed_binding_candidates`
+    /// consults `binding_sequence_postings` -- the one key that is unique per
+    /// distinct taught question -- only when it is given a target pool, and
+    /// both tier scorers passed `None`. So the SCORE half of a probe saw only
+    /// per-byte feature postings, which are capped at 512 and selected
+    /// NEWEST-first, while the ANSWER half
+    /// (`decode_best_trained_binding_with_context`) passed the target pool and
+    /// had the exact route. Measured off `docs/scorecard-baseline.json`: an
+    /// `on_material` probe costs 5.2 questions per attempt at scale 4 and 26.2
+    /// at scale 64 on question lengths that are IDENTICAL at every scale, and
+    /// 852 of 1,536 attempts at scale 64 end `budget_exhausted` with an
+    /// `empty` answer. A byte like `r` or a space is a member of nearly every
+    /// fact, so at 11,904 facts its feature posting list is ~23x the cap and
+    /// the newest 512 hold only the last rooms taught -- the taught
+    /// sub-question of an EARLY room is not in the candidate set at all, its
+    /// score cannot reach 1.0, and the cut is never located. That is a REACH
+    /// failure, and no probe budget reaches it.
+    ///
+    /// This cannot invent an answer: an exact-sequence posting is the binding
+    /// whose query atoms were observed in this order, and the derivation's
+    /// acceptance test (`score >= 1.0 && is_trained_frame`) is unchanged.
+    pub fn best_binding_match_routed(
+        &self,
+        query_pool: PoolId,
+        target_pool: Option<PoolId>,
+    ) -> BindingMatch {
+        let concept = self.best_binding_match_concept_tier(query_pool, target_pool);
+        if concept.tier == MatchTier::Concept {
+            return concept;
+        }
+        self.best_binding_match_atom_tier(query_pool, target_pool)
+    }
+
+    /// Find the best binding for the current query-pool firing state
+    /// AND decode its target-pool members verbatim.
+    ///
+    /// This is the "trained-answer" retrieval path: the binding
+    /// stores the exact atoms that co-fired with the query at
+    /// training time, so decoding its target-pool members returns
+    /// the literal trained response — no scoring formulas, no
+    /// avg-activation gymnastics, no concept-emergence side
+    /// effects like 'animala' suffix-pollution.
+    ///
+    /// Match tie-breaking: highest score (precision × recall).
+    /// Among ties, prefer the binding whose target-pool member
+    /// count is SMALLEST — cleanest binding wins.  Prefer
+    /// concept-tier matches over atom-tier when both exist.
+    ///
+    /// Returns `Some(bytes)` if a binding was found AND its
+    /// target-pool members decode to non-empty bytes.  `None`
+    /// otherwise (caller falls back to atom-level or chain path).
+    pub fn decode_best_trained_binding(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+    ) -> Option<Vec<u8>> {
+        self.decode_best_trained_binding_with_context(query_pool, target_pool, &[], &[])
+    }
+
+    /// Context-aware raw binding retrieval. Exact ordered sensory evidence is
+    /// always eligible; fuzzy overlap cannot borrow an episode conditioned on
+    /// a pool that is absent from the current query moment.
+    pub fn decode_best_trained_binding_with_context(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+    ) -> Option<Vec<u8>> {
+        self.decode_best_trained_binding_pair_with_context(
+            query_pool,
+            target_pool,
+            active_context_pools,
+            conditioned_pools,
+        )
+        .map(|(_, target)| target)
+    }
+
+    /// Decode both the query-side trained question and the target-side answer
+    /// of the winning binding for `query_pool -> target_pool`. Used by
+    /// `crate::relation_transfer` to align the asked question against the
+    /// exact trained question `base_question` whose answer it landed on.
+    pub fn decode_best_trained_binding_pair(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.decode_best_trained_binding_pair_with_context(query_pool, target_pool, &[], &[])
+    }
+
+    pub fn decode_best_trained_binding_pair_with_context(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        if query_pool == target_pool {
+            return None;
+        }
+        let bpid = self.binding_pool_id;
+        if bpid == query_pool || bpid == target_pool {
+            return None;
+        }
+
+        // Collect firing query state: atoms and concepts separately.
+        let (q_atoms, q_concepts) = {
+            let q = self.fabric.pool(query_pool)?;
+            let q = q.read();
+            let mut atoms = ahash::AHashSet::new();
+            let mut concepts = ahash::AHashSet::new();
+            for nid in q.currently_firing() {
+                match q.get(nid) {
+                    Some(n) if n.is_atom() => {
+                        atoms.insert(nid);
+                    }
+                    Some(_) => {
+                        concepts.insert(nid);
+                    }
+                    None => {}
+                }
+            }
+            (atoms, concepts)
+        };
+        if q_atoms.is_empty() && q_concepts.is_empty() {
+            return None;
+        }
+
+        // Minimum atom-tier score for an OOV-honest match.  A score
+        // of `p * r` where p = precision (intersect/bind_atoms.len())
+        // and r = recall (intersect/q_atoms.len()).  Empirically:
+        //   trained, full-overlap query (e.g. 'ball'->'toy'): 1.0
+        //   trained, concept-tier match (e.g. 'hand'->'body'):  >= 1.0
+        //   OOV partial atom bleed ('foobarbaz'->food): 0.44
+        //     (propagation inflates q_atoms ∩ bind atoms beyond
+        //      raw byte overlap, because bidirectional terminals
+        //      fire POOL_TEXT atoms co-trained with food)
+        //   OOV single-atom bleed ('xyzzy'->'body'):   0.08
+        // A 0.50 floor still passes trained queries (full-overlap
+        // atom-tier scores 1.0; concept-tier matches always score
+        // ≥ 1.0 via the concept-tier bonus when concept_score
+        // itself crosses the floor) and rejects OOV bleed.
+        // GA-tunable via `BRAIN_MIN_ATOM_SCORE` env var.
+        //
+        // DYNAMICAL: accepts either a scalar (→ Constant) OR a
+        // ControlMode JSON spec.  When DrivenBy, the floor adapts
+        // each call to current substrate state.  E.g.
+        // `DrivenBy(DecodePrecisionEma, 0.7, 0.2)` means "raise
+        // the floor when recent decodes have been confident; lower
+        // it when retrieval has been struggling so partial matches
+        // can still get through".  Read from query_pool's ControlState.
+        let min_atom_score: f32 = {
+            let raw = std::env::var("BRAIN_MIN_ATOM_SCORE").ok();
+            // Build query-pool state for ControlMode evaluation.
+            let state = self
+                .fabric
+                .pool(query_pool)
+                .map(|p| p.read().control_state());
+            match (raw, state) {
+                (Some(s), Some(st)) => {
+                    let s = s.trim().to_string();
+                    if let Ok(v) = s.parse::<f32>() {
+                        v.clamp(0.0, 1.0)
+                    } else if let Ok(mode) = serde_json::from_str::<crate::ControlMode>(&s) {
+                        mode.evaluate(&st).clamp(0.0, 1.0)
+                    } else {
+                        0.50
+                    }
+                }
+                _ => self.config.min_atom_score.clamp(0.0, 1.0),
+            }
+        };
+
+        // Capture the QUERY's last-observed ordered atom sequence
+        // from the query pool itself.  Pool::last_observed_sequence
+        // is rebuilt every observe_frame() call (no cross-query
+        // accumulation, unlike Fabric::current.fired which only
+        // resets on advance_tick).  This lets us preempt anagram
+        // ambiguity: 'sad' query (last_observed [s,a,d]) picks
+        // sad->emotion (ordered text [s,a,d]) over das->animal
+        // (ordered text [d,a,s]).
+        let query_seq: Vec<NeuronId> = self
+            .fabric
+            .pool(query_pool)
+            .map(|p| p.read().last_observed_sequence().to_vec())
+            .unwrap_or_default();
+
+        // Route to a bounded candidate set before touching the binding pool.
+        // Exact ordered evidence is authoritative and must preempt broad
+        // feature postings. Unioning those postings even after an exact hit
+        // made short, common prompts wake a corpus-scale binding population.
+        // Only an exact miss enters the fuzzy feature/motif route.
+        let exact_candidates = if query_seq.is_empty() {
+            Vec::new()
+        } else {
+            self.binding_sequence_postings(query_pool, target_pool, &query_seq)
+        };
+        let mut candidate_evidence = AHashMap::new();
+        add_binding_evidence(&mut candidate_evidence, exact_candidates);
+        if candidate_evidence.is_empty() {
+            let mut routing_atoms = q_atoms.clone();
+            if !q_concepts.is_empty() {
+                if let Some(query_handle) = self.fabric.pool(query_pool) {
+                    let query = query_handle.read();
+                    let mut pending: Vec<NeuronId> = q_concepts.iter().copied().collect();
+                    let mut visited = ahash::AHashSet::new();
+                    while let Some(id) = pending.pop() {
+                        if !visited.insert(id) {
+                            continue;
+                        }
+                        let Some(neuron) = query.get(id) else {
+                            continue;
+                        };
+                        if neuron.is_atom() {
+                            routing_atoms.insert(id);
+                        } else {
+                            pending.extend(
+                                neuron
+                                    .members
+                                    .iter()
+                                    .filter(|member| member.pool == query_pool)
+                                    .map(|member| member.neuron),
+                            );
+                        }
+                    }
+                }
+            }
+            let mut feature_postings: Vec<(NeuronId, Vec<NeuronId>)> = routing_atoms
+                .iter()
+                .map(|atom| (*atom, self.binding_feature_postings(query_pool, *atom)))
+                .filter(|(_, ids)| !ids.is_empty())
+                .collect();
+            feature_postings.sort_unstable_by_key(|(atom, ids)| (ids.len(), *atom));
+            for (_, ids) in feature_postings.into_iter().take(8) {
+                add_binding_evidence(&mut candidate_evidence, ids);
+            }
+            if !query_seq.is_empty() {
+                if let Some(query_handle) = self.fabric.pool(query_pool) {
+                    let query = query_handle.read();
+                    let goal_routes = self.goal_paged_binding_routes(&query, &query_seq);
+                    if !goal_routes.is_empty() {
+                        let boost: u16 = if goal_routes.len() <= MAX_ROUTED_BINDING_CANDIDATES {
+                            16
+                        } else {
+                            1
+                        };
+                        for id in goal_routes {
+                            let score = candidate_evidence.entry(id).or_insert(0);
+                            *score = score.saturating_add(boost);
+                        }
+                    }
+                    let refs: Vec<NeuronRef> = query_seq
+                        .iter()
+                        .map(|&neuron| NeuronRef {
+                            pool: query_pool,
+                            neuron,
+                        })
+                        .collect();
+                    let frame = query.decode_concept_members(&refs);
+                    let motifs = normalized_char_motifs(&frame);
+                    // Sorted on `(len, motif)` and NOT on `len` alone. The
+                    // motif set is an `ahash::AHashSet`, ahash is declared with
+                    // default features (so `RandomState` uses runtime-rng), and
+                    // its iteration order is therefore per PROCESS. Feeding
+                    // that order into a length-only UNSTABLE sort and then
+                    // cutting at 8 makes which postings become evidence depend
+                    // on the hash seed -- the cause of item 8accd975, measured
+                    // as integration_pct 35.19 then 35.0 at scale 16 on one
+                    // build. Keeping the motif beside its list makes the order
+                    // TOTAL (a motif is `[u8; 3]`, which is `Ord`, and motifs
+                    // are distinct because they came from a set), so the chosen
+                    // 8 are the same in every process. This is the idiom the
+                    // neighbouring sites already use -- see the
+                    // `(ids.len(), *atom)` sort above and the
+                    // `(ids.len(), *motif)` sort in
+                    // `rank_bounded_binding_evidence`'s caller.
+                    //
+                    // Scale 1 was already reproducible because it has fewer
+                    // than NINE non-empty postings, so the cut never bites and
+                    // the tie order is never observed.
+                    let mut postings: Vec<([u8; 3], Vec<NeuronId>)> = motifs
+                        .iter()
+                        .map(|motif| (*motif, self.binding_motif_postings(query_pool, *motif)))
+                        .filter(|(_, ids)| !ids.is_empty())
+                        .collect();
+                    postings.sort_unstable_by_key(|(motif, ids)| (ids.len(), *motif));
+                    for (_, ids) in postings.into_iter().take(8) {
+                        add_binding_evidence(&mut candidate_evidence, ids);
+                    }
+                }
+            }
+        }
+        if candidate_evidence.is_empty() {
+            return None;
+        }
+        let candidate_ids = rank_bounded_binding_evidence(
+            candidate_evidence,
+            MAX_ROUTED_BINDING_CANDIDATES,
+        );
+
+        // Wake only the routed binding bodies. Their member payload is absent
+        // while idle and must be present before scoring.
+        let bp = self.fabric.pool(bpid)?;
+        {
+            let mut bindings = bp.write();
+            for &binding_id in &candidate_ids {
+                if let Err(error) = bindings.ensure_loaded(binding_id) {
+                    tracing::warn!(
+                        "binding candidate page-in failed for {}: {}",
+                        binding_id,
+                        error
+                    );
+                }
+            }
+        }
+        let bp_read = bp.read();
+        // (binding_id, score, target_member_count, has_concept_match, seq_match)
+        let mut best: Option<(NeuronId, f32, usize, bool, bool)> = None;
+        for binding_id in candidate_ids {
+            let Some(n) = bp_read.get(binding_id) else {
+                continue;
+            };
+            // Partition this binding's members by pool.
+            // bind_q_atoms is a Vec (preserves ORDER from the moment
+            // fingerprint that promoted this binding).
+            let mut bind_q_atoms: Vec<NeuronId> = Vec::new();
+            let mut bind_q_concepts: Vec<NeuronId> = Vec::new();
+            let mut bind_target_members: Vec<NeuronId> = Vec::new();
+            {
+                let q = self.fabric.pool(query_pool)?;
+                let q = q.read();
+                for m in &n.members {
+                    if m.pool == query_pool {
+                        match q.get(m.neuron) {
+                            Some(qn) if qn.is_atom() => bind_q_atoms.push(m.neuron),
+                            Some(_) => {
+                                bind_q_concepts.push(m.neuron);
+                                if let Some(leaves) = q.expand_to_atom_leaves_bounded(&[m.neuron], 512) {
+                                    bind_q_atoms.extend(leaves);
+                                }
+                            }
+                            None => {}
+                        }
+                    } else if m.pool == target_pool {
+                        bind_target_members.push(m.neuron);
+                    }
+                }
+            }
+            if bind_target_members.is_empty() {
+                continue;
+            }
+            if bind_q_atoms.is_empty() && bind_q_concepts.is_empty() {
+                continue;
+            }
+
+            // Ordered equality is direct episodic evidence, not a fuzzy
+            // overlap score.  Compute it before the grounding floor: broad
+            // curricula can make an exact binding's set-based score share a
+            // band with OOV partial overlap, but an unseen query cannot equal
+            // a stored training sequence.  This is therefore both recall-
+            // preserving and OOV-honest.
+            let seq_match = !query_seq.is_empty() && bind_q_atoms == query_seq;
+            let missing_condition = !seq_match
+                && conditioned_pools.iter().any(|pool_id| {
+                    !active_context_pools.contains(pool_id)
+                        && n.members.iter().any(|member| member.pool == *pool_id)
+                });
+            if missing_condition {
+                continue;
+            }
+
+            // Compute score: prefer concept-tier when concept members
+            // overlap firing concepts; else atom-tier.
+            //
+            // CRITICAL: intersect must be UNIQUE-set intersect, not
+            // multi-set.  bind_q_atoms is a Vec (allows duplicates from
+            // multi-source fingerprints — same atom appearing twice in
+            // the binding's POOL_TEXT members), while q_atoms is a
+            // HashSet (deduplicated firing set).  Without dedup:
+            //   bind=[a,a,b,b,c,c,x]  q={a,b,c}
+            //   atom_intersect = 6 (counts each duplicate hit)
+            //   recall = 6 / 3 = 2.0   ← BROKEN, should cap at 1.0
+            // Toddler-collapse bug: this let multi-source bindings
+            // overscore single-pair bindings on duplicate atoms.
+            let bind_q_atoms_set: ahash::AHashSet<NeuronId> =
+                bind_q_atoms.iter().copied().collect();
+            let bind_q_concepts_set: ahash::AHashSet<NeuronId> =
+                bind_q_concepts.iter().copied().collect();
+            let concept_intersect = bind_q_concepts_set
+                .iter()
+                .filter(|c| q_concepts.contains(c))
+                .count() as f32;
+            let concept_score = if !bind_q_concepts_set.is_empty() && !q_concepts.is_empty() {
+                let p = concept_intersect / bind_q_concepts_set.len() as f32;
+                let r = concept_intersect / q_concepts.len().max(1) as f32;
+                p * r
+            } else {
+                0.0
+            };
+            let atom_intersect = bind_q_atoms_set
+                .iter()
+                .filter(|a| q_atoms.contains(a))
+                .count() as f32;
+            let atom_score = if !bind_q_atoms_set.is_empty() && !q_atoms.is_empty() {
+                let p = atom_intersect / bind_q_atoms_set.len() as f32;
+                let r = atom_intersect / q_atoms.len().max(1) as f32;
+                p * r
+            } else {
+                0.0
+            };
+            // OOV-honesty floor applies BOTH to atom-tier and to the
+            // raw concept_score.  Without this, a mega-binding with a
+            // 797-member POOL_TEXT footprint (runaway concept-of-
+            // concept emergence) wins every query with concept_score
+            // ≈ 0.005 because the +1.0 bonus pushes its total above
+            // any legitimate single-pair binding's atom-tier score.
+            // Concept-tier requires BOTH concept_score AND some atom
+            // corroboration.  Without the atom check, a single concept
+            // matching by partial-substring emergence (e.g. 'fox'
+            // concept fires from OOV 'foobarbaz') wins concept-tier
+            // preempt and breaks OOV honesty.
+            let concept_ok = concept_score >= min_atom_score && atom_score >= 0.20;
+            let atom_ok = seq_match || atom_score >= min_atom_score;
+            if !concept_ok && !atom_ok {
+                continue;
+            }
+
+            // Concept-tier match preempts atom-tier ONLY when the
+            // concept_score itself crosses the floor.
+            let base_score = if concept_ok {
+                concept_score + 1.0 // concept-tier preempt bonus
+            } else {
+                atom_score
+            };
+            let has_concept = concept_ok;
+
+            // Hebbian frequency weight: bindings trained more times
+            // dominate competing bindings.  Default multiplier =
+            // (1 + ln(use_count)).  DYNAMICAL: strength is read each
+            // call from BRAIN_FREQ_WEIGHT env var as a ControlMode.
+            // Constant(1.0) preserves the canonical formula; higher
+            // values amplify the gap between high- and low-uc
+            // bindings (helps resolve K-12 ties between bindings
+            // with similar use_count); DrivenBy(ConceptCountEma, ...)
+            // would let the multiplier grow as the substrate's
+            // binding pool grows, sharpening discrimination under
+            // dense training.
+            let freq_strength: f32 = {
+                let raw = std::env::var("BRAIN_FREQ_WEIGHT").ok();
+                let st = self
+                    .fabric
+                    .pool(query_pool)
+                    .map(|p| p.read().control_state());
+                match (raw, st) {
+                    (Some(s), Some(state)) => {
+                        let s = s.trim();
+                        if let Ok(v) = s.parse::<f32>() {
+                            v.clamp(0.0, 8.0)
+                        } else if let Ok(mode) = serde_json::from_str::<crate::ControlMode>(s) {
+                            mode.evaluate(&state).clamp(0.0, 8.0)
+                        } else {
+                            1.0
+                        }
+                    }
+                    _ => 1.0,
+                }
+            };
+            let uc = n.use_count.max(1) as f32;
+            let freq_weight = 1.0 + freq_strength * uc.ln();
+            let score = base_score * freq_weight;
+
+            let target_count = bind_target_members.len();
+
+            // Sequence-match preempt (anagram tiebreaker).  When the
+            // binding's text-side ordered sequence EXACTLY equals the
+            // query's observed firing sequence, this is a stronger
+            // signal than just atom-set match.  Distinguishes 'sad'
+            // query from 'das' binding even though both have the same
+            // multiset.  Empty query_seq disables this check.
+            let consider = match &best {
+                None => true,
+                Some((_, prev_score, prev_target_count, prev_has_concept, prev_seq_match)) => {
+                    // Sequence-match preempt is the highest tier.
+                    if seq_match && !*prev_seq_match {
+                        true
+                    } else if !seq_match && *prev_seq_match {
+                        false
+                    }
+                    // Concept-tier beats atom-tier.
+                    else if has_concept && !*prev_has_concept {
+                        true
+                    } else if !has_concept && *prev_has_concept {
+                        false
+                    }
+                    // Same tier — higher score wins.
+                    else if score > *prev_score {
+                        true
+                    } else if score < *prev_score {
+                        false
+                    }
+                    // Tie on score AND on use_count (freq weight) —
+                    // tiebreak by target_count.  Direction controlled
+                    // by BRAIN_TARGET_TIEBREAK env var as ControlMode
+                    // / scalar.  Value > 0.5 = prefer LARGER target
+                    // (helps K-12 sad->emotion vs das->animal when
+                    // they tie on score and use_count: emotion=7 bytes
+                    // > animal=6 bytes).  Default 0.0 = SMALLER target
+                    // (legacy behaviour, cleaner toddler decodes).
+                    else {
+                        let tiebreak_pref: f32 = {
+                            let raw = std::env::var("BRAIN_TARGET_TIEBREAK").ok();
+                            let st = self
+                                .fabric
+                                .pool(query_pool)
+                                .map(|p| p.read().control_state());
+                            match (raw, st) {
+                                (Some(s), Some(state)) => {
+                                    let s = s.trim();
+                                    if let Ok(v) = s.parse::<f32>() {
+                                        v.clamp(0.0, 1.0)
+                                    } else if let Ok(mode) =
+                                        serde_json::from_str::<crate::ControlMode>(s)
+                                    {
+                                        mode.evaluate(&state).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                                _ => 0.0,
+                            }
+                        };
+                        if tiebreak_pref >= 0.5 {
+                            target_count > *prev_target_count
+                        } else {
+                            target_count < *prev_target_count
+                        }
+                    }
+                }
+            };
+            if consider {
+                best = Some((n.id, score, target_count, has_concept, seq_match));
+            }
+        }
+
+        let (bnid, _, _, _, _) = best?;
+        let bnode = bp_read.get(bnid)?;
+        // A promoted binding can contain both the ordered target atoms and
+        // concepts that collapsed from those same atoms in the training
+        // moment.  Recursively decoding both serializes the leaves twice
+        // (for example `animal` + an `a` concept became `animala`).  The
+        // moment's ordered atoms are the lossless response representation;
+        // use concepts only for older/concept-only bindings that have no
+        // target atoms.
+        let query_members: Vec<NeuronRef> = bnode
+            .members
+            .iter()
+            .filter(|m| m.pool == query_pool)
+            .copied()
+            .collect();
+        let target_members: Vec<NeuronRef> = bnode
+            .members
+            .iter()
+            .filter(|m| m.pool == target_pool)
+            .copied()
+            .collect();
+        if target_members.is_empty() {
+            return None;
+        }
+        drop(bp_read);
+
+        let query_handle = self.fabric.pool(query_pool)?;
+        let query_bytes = {
+            let q = query_handle.read();
+            let q_atoms: Vec<NeuronRef> = query_members
+                .iter()
+                .filter(|m| q.get(m.neuron).is_some_and(|n| n.is_atom()))
+                .copied()
+                .collect();
+            if q_atoms.is_empty() {
+                q.decode_concept_members(&query_members)
+            } else {
+                q.decode_concept_members(&q_atoms)
+            }
+        };
+
+        let target_handle = self.fabric.pool(target_pool)?;
+        {
+            let roots: Vec<NeuronId> = target_members.iter().map(|member| member.neuron).collect();
+            ensure_neuron_trees_loaded(&mut target_handle.write(), &roots);
+        }
+        let t = target_handle.read();
+        let bytes = t.decode_concept_members(&target_members);
+        drop(t);
+
+        if bytes.is_empty() {
+            None
+        } else {
+            Some((query_bytes, bytes))
+        }
+    }
+
+    /// Whether the current ordered atom sequence has a directly observed
+    /// binding to `target_pool`.  This exposes evidence provenance to the API
+    /// router without decoding or scanning the binding pool.
+    pub fn has_exact_trained_binding(&self, query_pool: PoolId, target_pool: PoolId) -> bool {
+        let Some(pool) = self.fabric.pool(query_pool) else {
+            return false;
+        };
+        let sequence = pool.read().last_observed_sequence().to_vec();
+        !sequence.is_empty()
+            && !self
+                .binding_sequence_postings(query_pool, target_pool, &sequence)
+                .is_empty()
+    }
+
+    /// Decode a target from the joint firing state of several evidence pools.
+    /// Every requested pool must be represented in the learned binding and
+    /// must independently clear its coverage gate. This makes the readout an
+    /// integrated multi-stream moment rather than an average dominated by one
+    /// text channel.
+    pub fn decode_best_trained_binding_multi(
+        &mut self,
+        query_pools: &[PoolId],
+        target_pool: PoolId,
+    ) -> Option<Vec<u8>> {
+        self.decode_best_trained_binding_multi_scored(query_pools, target_pool)
+            .map(|(bytes, _score)| bytes)
+    }
+
+    /// Scored form of `decode_best_trained_binding_multi`.  The score is the
+    /// bounded geometric mean of per-pool evidence coverage before recurrence
+    /// is used to rank otherwise equivalent bindings.  Keeping confidence
+    /// separate from use-count prevents a frequently repeated market regime
+    /// from claiming certainty merely because it is common.
+    pub fn decode_best_trained_binding_multi_scored(
+        &mut self,
+        query_pools: &[PoolId],
+        target_pool: PoolId,
+    ) -> Option<(Vec<u8>, f32)> {
+        let mut query_ids: Vec<PoolId> = query_pools
+            .iter()
+            .copied()
+            .filter(|pid| *pid != target_pool && *pid != self.binding_pool_id)
+            .collect();
+        query_ids.sort_unstable();
+        query_ids.dedup();
+        if query_ids.is_empty() {
+            return None;
+        }
+        let candidate_binding_ids = self.hydrate_active_binding_scope(&query_ids, target_pool);
+        if candidate_binding_ids.is_empty() {
+            return None;
+        }
+        let min_pool_score = std::env::var("BRAIN_MULTI_MIN_POOL_SCORE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.20)
+            .clamp(0.0, 1.0);
+        let min_joint_score = std::env::var("BRAIN_MULTI_MIN_JOINT_SCORE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+
+        struct QueryState {
+            atoms: ahash::AHashSet<NeuronId>,
+            concepts: ahash::AHashSet<NeuronId>,
+            sequence: Vec<NeuronId>,
+        }
+        let mut states = std::collections::HashMap::new();
+        for pid in &query_ids {
+            let handle = self.fabric.pool(*pid)?;
+            let pool = handle.read();
+            let mut atoms = ahash::AHashSet::new();
+            let mut concepts = ahash::AHashSet::new();
+            for nid in pool.currently_firing() {
+                match pool.get(nid) {
+                    Some(n) if n.is_atom() => {
+                        atoms.insert(nid);
+                    }
+                    Some(_) => {
+                        concepts.insert(nid);
+                    }
+                    None => {}
+                }
+            }
+            if atoms.is_empty() && concepts.is_empty() {
+                return None;
+            }
+            states.insert(
+                *pid,
+                QueryState {
+                    atoms,
+                    concepts,
+                    sequence: pool.last_observed_sequence().to_vec(),
+                },
+            );
+        }
+
+        let binding_handle = self.fabric.pool(self.binding_pool_id)?;
+        let bindings = binding_handle.read();
+        // binding id, exact-sequence pool count, ranked score, target size,
+        // bounded evidence confidence
+        let mut best: Option<(NeuronId, usize, f32, usize, f32)> = None;
+        for binding_id in candidate_binding_ids {
+            let Some(binding) = bindings.get(binding_id) else {
+                continue;
+            };
+            if binding.is_atom() {
+                continue;
+            }
+            let target_members: Vec<NeuronRef> = binding
+                .members
+                .iter()
+                .filter(|m| m.pool == target_pool)
+                .copied()
+                .collect();
+            if target_members.is_empty() {
+                continue;
+            }
+
+            let mut joint_score = 1.0f32;
+            let mut exact_count = 0usize;
+            let mut valid = true;
+            for pid in &query_ids {
+                let state = &states[pid];
+                let pool_handle = self.fabric.pool(*pid)?;
+                let pool = pool_handle.read();
+                let mut member_atoms = Vec::new();
+                let mut member_concepts = ahash::AHashSet::new();
+                for member in binding.members.iter().filter(|m| m.pool == *pid) {
+                    match pool.get(member.neuron) {
+                        Some(n) if n.is_atom() => member_atoms.push(member.neuron),
+                        Some(_) => {
+                            member_concepts.insert(member.neuron);
+                            if let Some(leaves) = pool.expand_to_atom_leaves_bounded(&[member.neuron], 512) {
+                                member_atoms.extend(leaves);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                if member_atoms.is_empty() && member_concepts.is_empty() {
+                    valid = false;
+                    break;
+                }
+                let exact = !state.sequence.is_empty() && member_atoms == state.sequence;
+                if exact {
+                    exact_count += 1;
+                }
+                let member_atom_set: ahash::AHashSet<NeuronId> =
+                    member_atoms.iter().copied().collect();
+                let atom_hits = member_atom_set.intersection(&state.atoms).count() as f32;
+                let atom_score = if member_atom_set.is_empty() || state.atoms.is_empty() {
+                    0.0
+                } else {
+                    (atom_hits / member_atom_set.len() as f32)
+                        * (atom_hits / state.atoms.len() as f32)
+                };
+                let concept_hits = member_concepts.intersection(&state.concepts).count() as f32;
+                let concept_score = if member_concepts.is_empty() || state.concepts.is_empty() {
+                    0.0
+                } else {
+                    (concept_hits / member_concepts.len() as f32)
+                        * (concept_hits / state.concepts.len() as f32)
+                };
+                let pool_score = if exact {
+                    1.0
+                } else {
+                    atom_score.max(concept_score)
+                };
+                if pool_score < min_pool_score {
+                    valid = false;
+                    break;
+                }
+                // Product penalizes a weak evidence channel; the nth root
+                // below keeps scores comparable as topology adds pools.
+                joint_score *= pool_score.max(f32::EPSILON);
+            }
+            if !valid {
+                continue;
+            }
+            joint_score = joint_score.powf(1.0 / query_ids.len() as f32);
+            if joint_score < min_joint_score {
+                continue;
+            }
+            let evidence_confidence = joint_score.clamp(0.0, 1.0);
+            joint_score *= 1.0 + (binding.use_count.max(1) as f32).ln();
+            let candidate = (
+                binding.id,
+                exact_count,
+                joint_score,
+                target_members.len(),
+                evidence_confidence,
+            );
+            let replace = match best {
+                None => true,
+                Some((_, best_exact, best_score, best_size, _)) => {
+                    exact_count > best_exact
+                        || (exact_count == best_exact && joint_score > best_score)
+                        || (exact_count == best_exact
+                            && joint_score == best_score
+                            && target_members.len() < best_size)
+                }
+            };
+            if replace {
+                best = Some(candidate);
+            }
+        }
+
+        let (binding_id, _, _, _, evidence_confidence) = best?;
+        let binding = bindings.get(binding_id)?;
+        let target_handle = self.fabric.pool(target_pool)?;
+        let target = target_handle.read();
+        let members: Vec<NeuronRef> = binding
+            .members
+            .iter()
+            .filter(|m| m.pool == target_pool)
+            .copied()
+            .collect();
+        let atoms: Vec<NeuronRef> = members
+            .iter()
+            .filter(|member| {
+                target
+                    .get(member.neuron)
+                    .is_some_and(|neuron| neuron.is_atom())
+            })
+            .copied()
+            .collect();
+        let bytes = if atoms.is_empty() {
+            target.decode_concept_members(&members)
+        } else {
+            target.decode_concept_members(&atoms)
+        };
+        if bytes.is_empty() {
+            None
+        } else {
+            Some((bytes, evidence_confidence))
+        }
+    }
+
+    /// Wake only bindings reachable from the active query atoms or their
+    /// exact sequence index, then wake the member trees those bindings name.
+    /// Sleeping placeholders outside this scope remain serialized.
+    fn hydrate_active_binding_scope(
+        &mut self,
+        query_pools: &[PoolId],
+        target_pool: PoolId,
+    ) -> Vec<NeuronId> {
+        let mut binding_evidence = AHashMap::new();
+        for pool_id in query_pools {
+            let Some(pool_handle) = self.fabric.pool(*pool_id) else {
+                continue;
+            };
+            let pool = pool_handle.read();
+            for neuron_id in pool.currently_firing() {
+                if let Some(neuron) = pool.get(neuron_id) {
+                    if neuron.is_atom() {
+                        add_binding_evidence(
+                            &mut binding_evidence,
+                            self.binding_feature_postings(*pool_id, neuron_id),
+                        );
+                    }
+                    add_binding_evidence(
+                        &mut binding_evidence,
+                        neuron
+                            .terminals
+                            .iter()
+                            .filter(|terminal| terminal.target.pool == self.binding_pool_id)
+                            .map(|terminal| terminal.target.neuron),
+                    );
+                }
+            }
+            let sequence = pool.last_observed_sequence().to_vec();
+            if !sequence.is_empty() {
+                add_binding_evidence(
+                    &mut binding_evidence,
+                    self.binding_sequence_postings(*pool_id, target_pool, &sequence),
+                );
+                let goal_routes = self.goal_paged_binding_routes(&pool, &sequence);
+                if !goal_routes.is_empty() {
+                    let boost: u16 = if goal_routes.len() <= MAX_ROUTED_BINDING_CANDIDATES {
+                        16
+                    } else {
+                        1
+                    };
+                    for id in goal_routes {
+                        let score = binding_evidence.entry(id).or_insert(0);
+                        *score = score.saturating_add(boost);
+                    }
+                }
+            }
+            let refs: Vec<NeuronRef> = pool
+                .last_observed_sequence()
+                .iter()
+                .map(|&neuron| NeuronRef {
+                    pool: *pool_id,
+                    neuron,
+                })
+                .collect();
+            let frame = pool.decode_concept_members(&refs);
+            let motifs = normalized_char_motifs(&frame);
+            // Total order on `(len, motif)`, not on `len` alone. Same reason as
+            // the sort in `routed_binding_candidates` above: the motif set's
+            // iteration order is per process, so a length-only unstable sort
+            // cut at 8 picks a seed-dependent evidence set. Item 8accd975.
+            let mut postings: Vec<([u8; 3], Vec<NeuronId>)> = motifs
+                .iter()
+                .map(|motif| (*motif, self.binding_motif_postings(*pool_id, *motif)))
+                .filter(|(_, ids)| !ids.is_empty())
+                .collect();
+            postings.sort_unstable_by_key(|(motif, ids)| (ids.len(), *motif));
+            for (_, ids) in postings.into_iter().take(8) {
+                add_binding_evidence(&mut binding_evidence, ids);
+            }
+        }
+        let Some(binding_handle) = self.fabric.pool(self.binding_pool_id) else {
+            return Vec::new();
+        };
+        let routed_ids = rank_bounded_binding_evidence(
+            binding_evidence,
+            MAX_ROUTED_BINDING_CANDIDATES,
+        );
+        let mut members_by_pool: AHashMap<PoolId, Vec<NeuronId>> = AHashMap::new();
+        {
+            let mut bindings = binding_handle.write();
+            for &binding_id in &routed_ids {
+                if bindings.ensure_loaded(binding_id).is_err() {
+                    continue;
+                }
+                if let Some(binding) = bindings.get(binding_id) {
+                    for member in &binding.members {
+                        members_by_pool
+                            .entry(member.pool)
+                            .or_default()
+                            .push(member.neuron);
+                    }
+                }
+            }
+        }
+        for (pool_id, roots) in members_by_pool {
+            if let Some(pool) = self.fabric.pool(pool_id) {
+                ensure_neuron_trees_loaded(&mut pool.write(), &roots);
+            }
+        }
+        routed_ids
+    }
+
+    /// Return the exact ordered question/answer frames reachable from the
+    /// current query firing scope. This lets callers check a transfer against
+    /// bindings already active in the fabric without observing a generated
+    /// rewrite for every possible span.
+    pub fn active_binding_scope_pairs(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let candidate_ids = self.hydrate_active_binding_scope(&[query_pool], target_pool);
+        let Some(binding_handle) = self.fabric.pool(self.binding_pool_id) else {
+            return Vec::new();
+        };
+        let Some(query_handle) = self.fabric.pool(query_pool) else {
+            return Vec::new();
+        };
+        let Some(target_handle) = self.fabric.pool(target_pool) else {
+            return Vec::new();
+        };
+        let bindings = binding_handle.read();
+        let query = query_handle.read();
+        let target = target_handle.read();
+        candidate_ids
+            .into_iter()
+            .filter_map(|binding_id| {
+                let binding = bindings.get(binding_id)?;
+                let query_members: Vec<NeuronRef> = binding
+                    .members
+                    .iter()
+                    .filter(|member| member.pool == query_pool)
+                    .copied()
+                    .collect();
+                let target_members: Vec<NeuronRef> = binding
+                    .members
+                    .iter()
+                    .filter(|member| member.pool == target_pool)
+                    .copied()
+                    .collect();
+                if query_members.is_empty() || target_members.is_empty() {
+                    return None;
+                }
+                let question = query.decode_concept_members(&query_members);
+                let answer = target.decode_concept_members(&target_members);
+                if question.is_empty() || answer.is_empty() {
+                    None
+                } else {
+                    Some((question, answer))
+                }
+            })
+            .collect()
+    }
+
+    /// Rank learned actions whose feature atoms are fully covered by a larger
+    /// compositional query. Returned target bytes remain verbatim learned
+    /// evidence; callers may integrate structured artifacts such as manifests.
+    pub fn decode_ranked_feature_bindings(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        max_results: usize,
+    ) -> Vec<Vec<u8>> {
+        self.decode_ranked_feature_bindings_with_outcomes(
+            feature_pool,
+            query_labels,
+            target_pool,
+            max_results,
+            None,
+            None,
+        )
+    }
+
+    /// Outcome-weighted variant of [`Self::decode_ranked_feature_bindings`].
+    /// Candidate frames inherit valence from binding neurons where the same
+    /// action co-fired with externally observed success/failure pools. Scores
+    /// aggregate across bindings for identical raw target bytes, so a later
+    /// failure episode can inhibit an older neutral action without deleting
+    /// its atom substrate, while confirmed repair evidence promotes the fix.
+    pub fn decode_ranked_feature_bindings_with_outcomes(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        max_results: usize,
+        success_pool: Option<PoolId>,
+        failure_pool: Option<PoolId>,
+    ) -> Vec<Vec<u8>> {
+        self.decode_ranked_feature_bindings_with_context(
+            feature_pool,
+            query_labels,
+            target_pool,
+            max_results,
+            success_pool,
+            failure_pool,
+            &[],
+            &[],
+        )
+    }
+
+    /// Context-aware feature readout. A binding conditioned on one of
+    /// `conditioned_pools` is eligible only when that pool is present among
+    /// `active_context_pools`. This prevents a domain-labelled corpus episode
+    /// from masquerading as a context-free semantic rule.
+    pub fn decode_ranked_feature_bindings_with_context(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        max_results: usize,
+        success_pool: Option<PoolId>,
+        failure_pool: Option<PoolId>,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+    ) -> Vec<Vec<u8>> {
+        self.decode_ranked_feature_bindings_with_evidence(
+            feature_pool,
+            query_labels,
+            target_pool,
+            max_results,
+            success_pool,
+            failure_pool,
+            active_context_pools,
+            conditioned_pools,
+        )
+        .into_iter()
+        .map(|candidate| candidate.bytes)
+        .collect()
+    }
+
+    /// Evidence-preserving form of
+    /// [`Self::decode_ranked_feature_bindings_with_context`]. The byte-only
+    /// API remains for compatibility; orchestration and composition should
+    /// use this method so prompt coverage, outcome valence, and learned
+    /// pathway strength survive recall.
+    pub fn decode_ranked_feature_bindings_with_evidence(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        max_results: usize,
+        success_pool: Option<PoolId>,
+        failure_pool: Option<PoolId>,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+    ) -> Vec<RankedFeatureBinding> {
+        self.decode_ranked_feature_bindings_with_evidence_filtered(
+            feature_pool,
+            query_labels,
+            target_pool,
+            max_results,
+            success_pool,
+            failure_pool,
+            active_context_pools,
+            conditioned_pools,
+            None,
+        )
+    }
+
+    /// Return the strongest feature-grounded action that also satisfies a
+    /// caller-owned deterministic validator. Filtering happens before
+    /// `max_results` truncation, so a popular but behaviorally incompatible
+    /// corpus action cannot crowd a rarer correct episode out of a bounded
+    /// readout. The validator sees only verbatim learned target bytes.
+    pub fn decode_first_ranked_feature_binding_with_context_where(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        success_pool: Option<PoolId>,
+        failure_pool: Option<PoolId>,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+        validator: &dyn Fn(&[u8]) -> bool,
+    ) -> Option<Vec<u8>> {
+        self.decode_ranked_feature_bindings_with_context_where(
+            feature_pool,
+            query_labels,
+            target_pool,
+            1,
+            success_pool,
+            failure_pool,
+            active_context_pools,
+            conditioned_pools,
+            validator,
+        )
+        .into_iter()
+        .next()
+    }
+
+    /// Plural form of the validator-protected readout. This is used by
+    /// project composition, where several independently grounded manifests
+    /// or fragments must survive popularity truncation.
+    pub fn decode_ranked_feature_bindings_with_context_where(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        max_results: usize,
+        success_pool: Option<PoolId>,
+        failure_pool: Option<PoolId>,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+        validator: &dyn Fn(&[u8]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        self.decode_ranked_feature_bindings_with_evidence_filtered(
+            feature_pool,
+            query_labels,
+            target_pool,
+            max_results,
+            success_pool,
+            failure_pool,
+            active_context_pools,
+            conditioned_pools,
+            Some(validator),
+        )
+        .into_iter()
+        .map(|candidate| candidate.bytes)
+        .collect()
+    }
+
+    fn decode_ranked_feature_bindings_with_evidence_filtered(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+        max_results: usize,
+        success_pool: Option<PoolId>,
+        failure_pool: Option<PoolId>,
+        active_context_pools: &[PoolId],
+        conditioned_pools: &[PoolId],
+        validator: Option<&dyn Fn(&[u8]) -> bool>,
+    ) -> Vec<RankedFeatureBinding> {
+        if max_results == 0
+            || feature_pool == target_pool
+            || feature_pool == self.binding_pool_id
+            || target_pool == self.binding_pool_id
+        {
+            return Vec::new();
+        }
+        let feature_handle = match self.fabric.pool(feature_pool) {
+            Some(pool) => pool,
+            None => return Vec::new(),
+        };
+        let (query_atoms, query_atom_labels): (
+            ahash::AHashSet<NeuronId>,
+            ahash::AHashMap<NeuronId, String>,
+        ) = {
+            let features = feature_handle.read();
+            let labels: ahash::AHashMap<NeuronId, String> = query_labels
+                .iter()
+                .filter_map(|label| {
+                    features
+                        .label_to_id(label)
+                        .map(|neuron| (neuron, label.clone()))
+                })
+                .collect();
+            (labels.keys().copied().collect(), labels)
+        };
+        if query_atoms.len() < 2 {
+            return Vec::new();
+        }
+        // Joint semantic evidence preempts broad single-feature postings when
+        // available. Legacy containers transparently fall back until a
+        // recurrent/new binding has populated composite keys.
+        let (candidate_evidence, _) =
+            self.feature_route_evidence(feature_pool, &query_atoms);
+        let candidate_ids = rank_bounded_binding_evidence(
+            candidate_evidence,
+            MAX_ROUTED_BINDING_CANDIDATES,
+        );
+        if candidate_ids.is_empty() {
+            return Vec::new();
+        }
+
+        fn collect_atoms(
+            pool: &crate::Pool,
+            neuron_id: NeuronId,
+            output: &mut ahash::AHashSet<NeuronId>,
+        ) {
+            let Some(neuron) = pool.get(neuron_id) else {
+                return;
+            };
+            if neuron.is_atom() {
+                output.insert(neuron_id);
+            } else {
+                for member in &neuron.members {
+                    if member.pool == pool.id() {
+                        collect_atoms(pool, member.neuron, output);
+                    }
+                }
+            }
+        }
+
+        let binding_handle = match self.fabric.pool(self.binding_pool_id) {
+            Some(pool) => pool,
+            None => return Vec::new(),
+        };
+        {
+            let mut bindings = binding_handle.write();
+            for binding_id in &candidate_ids {
+                if let Err(error) = bindings.ensure_loaded(*binding_id) {
+                    tracing::warn!(
+                        "feature binding page-in failed for {}: {}",
+                        binding_id,
+                        error
+                    );
+                }
+            }
+        }
+        let bindings = binding_handle.read();
+        let feature_roots: Vec<NeuronId> = candidate_ids
+            .iter()
+            .filter_map(|binding_id| bindings.get(*binding_id))
+            .flat_map(|binding| {
+                binding
+                    .members
+                    .iter()
+                    .filter(move |member| member.pool == feature_pool)
+                    .map(|member| member.neuron)
+            })
+            .collect();
+        ensure_neuron_trees_loaded(&mut feature_handle.write(), &feature_roots);
+        let features = feature_handle.read();
+        let mut ranked: Vec<(NeuronId, usize, usize, u64, usize, i32, Vec<NeuronId>)> =
+            Vec::new();
+        for binding_id in candidate_ids {
+            let Some(binding) = bindings.get(binding_id) else {
+                continue;
+            };
+            if binding.is_atom() {
+                continue;
+            }
+            let missing_condition = conditioned_pools.iter().any(|pool_id| {
+                !active_context_pools.contains(pool_id)
+                    && binding.members.iter().any(|member| member.pool == *pool_id)
+            });
+            if missing_condition {
+                continue;
+            }
+            let direct_atoms: ahash::AHashSet<NeuronId> = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == feature_pool)
+                .filter(|member| {
+                    features
+                        .get(member.neuron)
+                        .is_some_and(|neuron| neuron.is_atom())
+                })
+                .map(|member| member.neuron)
+                .collect();
+            let mut expanded_atoms = ahash::AHashSet::new();
+            for member in binding
+                .members
+                .iter()
+                .filter(|member| member.pool == feature_pool)
+            {
+                collect_atoms(&features, member.neuron, &mut expanded_atoms);
+            }
+            // Direct atoms and an emerged concept are alternative evidence
+            // layers. Unioning them can make a broad concept's unrelated
+            // members mandatory and hide an otherwise exact sparse binding.
+            let evidence = [&direct_atoms, &expanded_atoms]
+                .into_iter()
+                .filter_map(|atoms| {
+                    if atoms.len() >= 2 && atoms.is_subset(&query_atoms) {
+                        Some((
+                            atoms.len(),
+                            atoms.len(),
+                            atoms.iter().copied().collect::<Vec<_>>(),
+                        ))
+                    } else if query_atoms.len() >= 2
+                        && query_atoms.is_subset(atoms)
+                        && atoms.len() == query_atoms.len() + 1
+                    {
+                        // Language + one grounded behavior is sufficient to
+                        // recall an episode with one additional learned
+                        // constraint (for example, an idempotent service
+                        // whose implementation also validates input). Wider
+                        // supersets remain ineligible.
+                        Some((
+                            query_atoms.len(),
+                            atoms.len(),
+                            query_atoms.iter().copied().collect::<Vec<_>>(),
+                        ))
+                    } else if validator.is_some()
+                        && query_atoms.len() >= 2
+                        && query_atoms.is_subset(atoms)
+                    {
+                        // A deterministic behavioral validator makes a
+                        // richer learned episode safe to consider even when
+                        // the paraphrase activates only a smaller grounded
+                        // subset. Keep the learned width in the rank so the
+                        // narrowest compatible episode still wins.
+                        Some((
+                            query_atoms.len(),
+                            atoms.len(),
+                            query_atoms.iter().copied().collect::<Vec<_>>(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .max_by_key(|(hits, learned, _)| (*hits, std::cmp::Reverse(*learned)));
+            let Some((hits, learned_feature_count, matched_atoms)) = evidence else {
+                continue;
+            };
+            if hits < 2 {
+                continue;
+            }
+            let target_size = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == target_pool)
+                .count();
+            if target_size == 0 {
+                continue;
+            }
+            let has_success = success_pool
+                .is_some_and(|pool| binding.members.iter().any(|member| member.pool == pool));
+            let has_failure = failure_pool
+                .is_some_and(|pool| binding.members.iter().any(|member| member.pool == pool));
+            let outcome = if has_success {
+                1
+            } else if has_failure {
+                -1
+            } else {
+                0
+            };
+            ranked.push((
+                binding.id,
+                hits,
+                learned_feature_count,
+                binding.use_count,
+                target_size,
+                outcome,
+                matched_atoms,
+            ));
+        }
+        ranked.sort_by(|a, b| {
+            b.5.cmp(&a.5)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| b.3.cmp(&a.3))
+                .then_with(|| a.4.cmp(&b.4))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let target_handle = match self.fabric.pool(target_pool) {
+            Some(pool) => pool,
+            None => return Vec::new(),
+        };
+        let target_roots: Vec<NeuronId> = ranked
+            .iter()
+            .filter_map(|(binding_id, _, _, _, _, _, _)| bindings.get(*binding_id))
+            .flat_map(|binding| {
+                binding
+                    .members
+                    .iter()
+                    .filter(move |member| member.pool == target_pool)
+                    .map(|member| member.neuron)
+            })
+            .collect();
+        ensure_neuron_trees_loaded(&mut target_handle.write(), &target_roots);
+        let target = target_handle.read();
+        let mut aggregated: std::collections::HashMap<
+            Vec<u8>,
+            (
+                i32,
+                usize,
+                usize,
+                u64,
+                usize,
+                NeuronId,
+                std::collections::BTreeSet<String>,
+            ),
+        > = std::collections::HashMap::new();
+        for (
+            binding_id,
+            hits,
+            learned_feature_count,
+            use_count,
+            target_size,
+            outcome,
+            matched_atoms,
+        ) in ranked
+        {
+            let Some(binding) = bindings.get(binding_id) else {
+                continue;
+            };
+            let members: Vec<NeuronRef> = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == target_pool)
+                .copied()
+                .collect();
+            let atoms: Vec<NeuronRef> = members
+                .iter()
+                .filter(|member| {
+                    target
+                        .get(member.neuron)
+                        .is_some_and(|neuron| neuron.is_atom())
+                })
+                .copied()
+                .collect();
+            let bytes = if atoms.is_empty() {
+                target.decode_concept_members(&members)
+            } else {
+                target.decode_concept_members(&atoms)
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            let matched_labels: std::collections::BTreeSet<String> = matched_atoms
+                .iter()
+                .filter_map(|atom| query_atom_labels.get(atom).cloned())
+                .collect();
+            let entry = aggregated.entry(bytes).or_insert((
+                0,
+                hits,
+                learned_feature_count,
+                use_count,
+                target_size,
+                binding_id,
+                std::collections::BTreeSet::new(),
+            ));
+            entry.0 += outcome;
+            entry.6.extend(matched_labels);
+            if (
+                hits,
+                std::cmp::Reverse(learned_feature_count),
+                use_count,
+                std::cmp::Reverse(target_size),
+                std::cmp::Reverse(binding_id),
+            ) > (
+                entry.1,
+                std::cmp::Reverse(entry.2),
+                entry.3,
+                std::cmp::Reverse(entry.4),
+                std::cmp::Reverse(entry.5),
+            ) {
+                entry.1 = hits;
+                entry.2 = learned_feature_count;
+                entry.3 = use_count;
+                entry.4 = target_size;
+                entry.5 = binding_id;
+            }
+        }
+        let mut decoded: Vec<_> = aggregated.into_iter().collect();
+        decoded.sort_by(|a, b| {
+            b.1.0
+                .cmp(&a.1.0)
+                .then_with(|| b.1.1.cmp(&a.1.1))
+                .then_with(|| a.1.2.cmp(&b.1.2))
+                .then_with(|| b.1.3.cmp(&a.1.3))
+                .then_with(|| a.1.4.cmp(&b.1.4))
+                .then_with(|| a.1.5.cmp(&b.1.5))
+        });
+        let has_nonnegative = decoded.iter().any(|(_, rank)| rank.0 >= 0);
+        decoded
+            .into_iter()
+            .filter(|(_, rank)| !has_nonnegative || rank.0 >= 0)
+            .filter(|(bytes, _)| validator.is_none_or(|accept| accept(bytes)))
+            .take(max_results)
+            .map(|(bytes, rank)| RankedFeatureBinding {
+                bytes,
+                matched_labels: rank.6.into_iter().collect(),
+                learned_feature_count: rank.2,
+                outcome_score: rank.0,
+                use_count: rank.3,
+                target_size: rank.4,
+                binding_id: rank.5,
+            })
+            .collect()
+    }
+
+    /// Return a target only when one learned binding covers the complete
+    /// activated feature set. This is stricter than ranked composition,
+    /// whose candidates are intentionally allowed to cover subsets so that
+    /// several independent behaviors can be merged.
+    pub fn decode_exact_feature_binding(
+        &self,
+        feature_pool: PoolId,
+        query_labels: &[String],
+        target_pool: PoolId,
+    ) -> Option<Vec<u8>> {
+        let feature_handle = self.fabric.pool(feature_pool)?;
+        let query_atoms: ahash::AHashSet<NeuronId> = {
+            let feature = feature_handle.read();
+            query_labels
+                .iter()
+                .filter_map(|label| feature.label_to_id(label))
+                .collect()
+        };
+        if query_atoms.len() < 2 {
+            return None;
+        }
+        let (candidate_evidence, _) =
+            self.feature_route_evidence(feature_pool, &query_atoms);
+        let candidate_ids = rank_bounded_binding_evidence(
+            candidate_evidence,
+            MAX_ROUTED_BINDING_CANDIDATES,
+        );
+        if candidate_ids.is_empty() {
+            return None;
+        }
+        let bindings_handle = self.fabric.pool(self.binding_pool_id)?;
+        {
+            let mut bindings = bindings_handle.write();
+            for binding_id in &candidate_ids {
+                if let Err(error) = bindings.ensure_loaded(*binding_id) {
+                    tracing::warn!(
+                        "exact feature binding page-in failed for {}: {}",
+                        binding_id,
+                        error
+                    );
+                }
+            }
+        }
+        let bindings = bindings_handle.read();
+        let feature_roots: Vec<NeuronId> = candidate_ids
+            .iter()
+            .filter_map(|binding_id| bindings.get(*binding_id))
+            .flat_map(|binding| {
+                binding
+                    .members
+                    .iter()
+                    .filter(move |member| member.pool == feature_pool)
+                    .map(|member| member.neuron)
+            })
+            .collect();
+        ensure_neuron_trees_loaded(&mut feature_handle.write(), &feature_roots);
+        let feature = feature_handle.read();
+        fn collect_atoms(
+            pool: &crate::Pool,
+            neuron_id: NeuronId,
+            output: &mut ahash::AHashSet<NeuronId>,
+        ) {
+            let Some(neuron) = pool.get(neuron_id) else {
+                return;
+            };
+            if neuron.is_atom() {
+                output.insert(neuron_id);
+            } else {
+                for member in &neuron.members {
+                    if member.pool == pool.id() {
+                        collect_atoms(pool, member.neuron, output);
+                    }
+                }
+            }
+        }
+        // Direct atom equality is stronger evidence than equality obtained by
+        // recursively expanding a collapsed concept.  Old, heavily-used
+        // concepts can contain the same atom set after historical co-firing;
+        // allowing their use count to beat a newer direct episode causes
+        // unrelated actions to hijack an otherwise exact feature query.
+        let mut exact_candidates: Vec<(NeuronId, bool, u64)> = Vec::new();
+        for binding_id in candidate_ids {
+            let Some(binding) = bindings.get(binding_id) else {
+                continue;
+            };
+            if binding.is_atom() {
+                continue;
+            }
+            let direct_atoms: ahash::AHashSet<NeuronId> = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == feature_pool)
+                .filter(|member| {
+                    feature
+                        .get(member.neuron)
+                        .is_some_and(|neuron| neuron.is_atom())
+                })
+                .map(|member| member.neuron)
+                .collect();
+            let mut expanded_atoms = ahash::AHashSet::new();
+            for member in binding
+                .members
+                .iter()
+                .filter(|member| member.pool == feature_pool)
+            {
+                collect_atoms(&feature, member.neuron, &mut expanded_atoms);
+            }
+            let direct_exact = direct_atoms == query_atoms;
+            if !direct_exact && expanded_atoms != query_atoms {
+                continue;
+            }
+            if !binding
+                .members
+                .iter()
+                .any(|member| member.pool == target_pool)
+            {
+                continue;
+            }
+            exact_candidates.push((binding.id, direct_exact, binding.use_count));
+        }
+        let strongest_directness = exact_candidates
+            .iter()
+            .map(|(_, direct, _)| *direct)
+            .max()?;
+        let target_handle = self.fabric.pool(target_pool)?;
+        let target_roots: Vec<NeuronId> = exact_candidates
+            .iter()
+            .filter_map(|(binding_id, _, _)| bindings.get(*binding_id))
+            .flat_map(|binding| {
+                binding
+                    .members
+                    .iter()
+                    .filter(move |member| member.pool == target_pool)
+                    .map(|member| member.neuron)
+            })
+            .collect();
+        ensure_neuron_trees_loaded(&mut target_handle.write(), &target_roots);
+        let target = target_handle.read();
+        let mut decoded: Vec<(Vec<u8>, u64)> = Vec::new();
+        for (binding_id, _, uses) in exact_candidates
+            .into_iter()
+            .filter(|(_, direct, _)| *direct == strongest_directness)
+        {
+            let binding = bindings.get(binding_id)?;
+            let members: Vec<NeuronRef> = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == target_pool)
+                .copied()
+                .collect();
+            let atoms: Vec<NeuronRef> = members
+                .iter()
+                .filter(|member| {
+                    target
+                        .get(member.neuron)
+                        .is_some_and(|neuron| neuron.is_atom())
+                })
+                .copied()
+                .collect();
+            let bytes = if atoms.is_empty() {
+                target.decode_concept_members(&members)
+            } else {
+                target.decode_concept_members(&atoms)
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if let Some((_, existing_uses)) =
+                decoded.iter_mut().find(|(existing, _)| *existing == bytes)
+            {
+                *existing_uses = (*existing_uses).max(uses);
+            } else {
+                decoded.push((bytes, uses));
+            }
+        }
+        // Sparse features describe a class of requests, not necessarily one
+        // unique artifact.  If the same complete feature set was wired to
+        // different targets, historical use_count cannot supply the missing
+        // prompt evidence.  Report ambiguity so the caller can defer to its
+        // raw character/context ranking instead of returning the most-used
+        // but potentially unrelated artifact.
+        if decoded.len() != 1 {
+            return None;
+        }
+        decoded.pop().map(|(bytes, _)| bytes)
+    }
+
+    /// Decode a learned target binding by similarity of overlapping character
+    /// motifs in the raw source frames. This is an atom-stream generalization
+    /// path: it uses normalized character trigrams, never word tokens, and
+    /// returns only verbatim target evidence from an existing binding.
+    pub fn decode_best_binding_by_char_motifs(
+        &self,
+        query_pool: PoolId,
+        query_frame: &[u8],
+        target_pool: PoolId,
+        min_score: f32,
+    ) -> Option<Vec<u8>> {
+        self.decode_best_binding_by_char_motifs_with_margin(
+            query_pool,
+            query_frame,
+            target_pool,
+            min_score,
+            0.0,
+        )
+        .map(|(bytes, _, _)| bytes)
+    }
+
+    /// Scored character-motif route with a winner-vs-runner-up intent-class
+    /// margin. Bindings that decode to the same target frame reinforce one
+    /// class; they do not compete as separate memorized paraphrases.
+    pub fn decode_best_binding_by_char_motifs_with_margin(
+        &self,
+        query_pool: PoolId,
+        query_frame: &[u8],
+        target_pool: PoolId,
+        min_score: f32,
+        min_margin: f32,
+    ) -> Option<(Vec<u8>, f32, f32)> {
+        self.decode_best_binding_by_char_motifs_with_margin_filtered(
+            query_pool,
+            query_frame,
+            target_pool,
+            min_score,
+            min_margin,
+            None,
+        )
+    }
+
+    /// Character-motif recall whose candidate action must also satisfy an
+    /// independent deterministic constraint. Filtering happens before the
+    /// winner and margin are chosen, allowing sparse semantic evidence to
+    /// inhibit a superficially similar but behaviorally unrelated episode
+    /// without replacing the raw atom-stream route.
+    pub fn decode_best_binding_by_char_motifs_with_margin_where(
+        &self,
+        query_pool: PoolId,
+        query_frame: &[u8],
+        target_pool: PoolId,
+        min_score: f32,
+        min_margin: f32,
+        validator: &dyn Fn(&[u8]) -> bool,
+    ) -> Option<(Vec<u8>, f32, f32)> {
+        self.decode_best_binding_by_char_motifs_with_margin_filtered(
+            query_pool,
+            query_frame,
+            target_pool,
+            min_score,
+            min_margin,
+            Some(validator),
+        )
+    }
+
+    /// Motif recall over the wide sensory scope, without a validator.
+    ///
+    /// The narrow eight-motif budget is a latency bound for routes that have
+    /// other evidence to fall back on. A route that runs only as the last arm
+    /// before answering nothing does not: measured 2026-08-20, "Make a Django
+    /// model to store expressions and variables" scores 0.661 against the
+    /// right unit when every trained prompt is compared, but the eight rarest
+    /// motifs never put that binding in the candidate set, so the brain
+    /// returned nothing. Paying the wider scan is strictly better than
+    /// abstaining on evidence the fabric holds.
+    pub fn decode_best_binding_by_char_motifs_wide(
+        &self,
+        query_pool: PoolId,
+        query_frame: &[u8],
+        target_pool: PoolId,
+        min_score: f32,
+        min_margin: f32,
+    ) -> Option<(Vec<u8>, f32, f32)> {
+        self.decode_best_binding_by_char_motifs_inner(
+            query_pool,
+            query_frame,
+            target_pool,
+            min_score,
+            min_margin,
+            None,
+            WIDE_MOTIF_POSTING_LIMIT,
+        )
+    }
+
+    fn decode_best_binding_by_char_motifs_with_margin_filtered(
+        &self,
+        query_pool: PoolId,
+        query_frame: &[u8],
+        target_pool: PoolId,
+        min_score: f32,
+        min_margin: f32,
+        validator: Option<&dyn Fn(&[u8]) -> bool>,
+    ) -> Option<(Vec<u8>, f32, f32)> {
+        let posting_limit = if validator.is_some() {
+            // Scale the consulted postings with the query's own size.
+            //
+            // A fixed 32 covers a short request's motifs almost completely
+            // and a long one barely at all, so the same component request
+            // reaches its manifest or does not depending on how wordy the
+            // surrounding sentence is. Measured 2026-08-26 on cross_project's
+            // bounded_audit_pipeline: the PYTHON+SECRET_REDACTION subset
+            // returned observability.py for the paraphrase and NOTHING for
+            // the canonical -- identical labels, identical behaviour prefix
+            // -- and deleting the single word "JSON" from the canonical
+            // recovered it. The manifest was never scored, because it was
+            // not reachable through the 32 postings that survived.
+            //
+            // A validator can reject every closest match, so this route has
+            // to look further than one whose alternative is another route.
+            // Half the query's motifs, floored at the old 32 so no short
+            // request loses reach, and capped so a very long request cannot
+            // walk the whole index.
+            let motif_count = normalized_char_motifs(query_frame).len();
+            (motif_count / 2).clamp(WIDE_MOTIF_POSTING_LIMIT, 128)
+        } else {
+            NARROW_MOTIF_POSTING_LIMIT
+        };
+        self.decode_best_binding_by_char_motifs_inner(
+            query_pool,
+            query_frame,
+            target_pool,
+            min_score,
+            min_margin,
+            validator,
+            posting_limit,
+        )
+    }
+
+    fn decode_best_binding_by_char_motifs_inner(
+        &self,
+        query_pool: PoolId,
+        query_frame: &[u8],
+        target_pool: PoolId,
+        min_score: f32,
+        min_margin: f32,
+        validator: Option<&dyn Fn(&[u8]) -> bool>,
+        posting_limit: usize,
+    ) -> Option<(Vec<u8>, f32, f32)> {
+        if query_pool == target_pool
+            || query_pool == self.binding_pool_id
+            || target_pool == self.binding_pool_id
+        {
+            return None;
+        }
+        let query_motifs = normalized_char_motifs(query_frame);
+        if query_motifs.is_empty() {
+            return None;
+        }
+        let query_handle = self.fabric.pool(query_pool)?;
+        let query = query_handle.read();
+        let bindings_handle = self.fabric.pool(self.binding_pool_id)?;
+        let bindings = bindings_handle.read();
+        let target_handle = self.fabric.pool(target_pool)?;
+        let target = target_handle.read();
+        let mut classes: std::collections::HashMap<Vec<u8>, (f32, u64)> =
+            std::collections::HashMap::new();
+        let mut posting_lists: Vec<([u8; 3], Vec<NeuronId>)> = query_motifs
+            .iter()
+            .map(|motif| (*motif, self.binding_motif_postings(query_pool, *motif)))
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect();
+        posting_lists.sort_unstable_by_key(|(motif, ids)| (ids.len(), *motif));
+        let mut candidate_evidence = AHashMap::new();
+        for (_, ids) in posting_lists.into_iter().take(posting_limit) {
+            add_binding_evidence(&mut candidate_evidence, ids);
+        }
+        let candidate_ids = rank_bounded_binding_evidence(
+            candidate_evidence,
+            MAX_ROUTED_BINDING_CANDIDATES,
+        );
+        drop(bindings);
+        {
+            let mut bindings = bindings_handle.write();
+            for binding_id in &candidate_ids {
+                if let Err(error) = bindings.ensure_loaded(*binding_id) {
+                    tracing::warn!("motif binding page-in failed for {}: {}", binding_id, error);
+                }
+            }
+        }
+        let bindings = bindings_handle.read();
+        drop(target);
+        let target_roots: Vec<NeuronId> = candidate_ids
+            .iter()
+            .filter_map(|binding_id| bindings.get(*binding_id))
+            .flat_map(|binding| {
+                binding
+                    .members
+                    .iter()
+                    .filter(move |member| member.pool == target_pool)
+                    .map(|member| member.neuron)
+            })
+            .collect();
+        ensure_neuron_trees_loaded(&mut target_handle.write(), &target_roots);
+        let target = target_handle.read();
+        for binding_id in candidate_ids {
+            let Some(binding) = bindings.get(binding_id) else {
+                continue;
+            };
+            if binding.is_atom() {
+                continue;
+            }
+            if !binding
+                .members
+                .iter()
+                .any(|member| member.pool == target_pool)
+            {
+                continue;
+            }
+            let source_atoms: Vec<NeuronRef> = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == query_pool)
+                .filter(|member| {
+                    query
+                        .get(member.neuron)
+                        .is_some_and(|neuron| neuron.is_atom())
+                })
+                .copied()
+                .collect();
+            if source_atoms.is_empty() {
+                continue;
+            }
+            let learned_frame = query.decode_concept_members(&source_atoms);
+            let learned_motifs = normalized_char_motifs(&learned_frame);
+            if learned_motifs.is_empty() {
+                continue;
+            }
+            // Unweighted Dice over shared motifs.
+            //
+            // Weighting each motif by 1/ln(postings) -- rarity taken from the
+            // fabric's own index -- sharpened contested margins 37x, but
+            // collapsed the exact matches it was meant to help: "the first
+            // law of thermodynamics" fell from 1.0 to 0.084, because
+            // weighting the denominator penalises the short keys that match
+            // perfectly. The structural fixes around this (reachable branch,
+            // duplicates are not rivals, margin scaled by certainty) are what
+            // unblocked recall; the metric itself was never the problem.
+            let overlap = query_motifs.intersection(&learned_motifs).count() as f32;
+            let score =
+                (2.0 * overlap) / (query_motifs.len() + learned_motifs.len()) as f32;
+            if score < min_score {
+                continue;
+            }
+            let members: Vec<NeuronRef> = binding
+                .members
+                .iter()
+                .filter(|member| member.pool == target_pool)
+                .copied()
+                .collect();
+            let atoms: Vec<NeuronRef> = members
+                .iter()
+                .filter(|member| {
+                    target
+                        .get(member.neuron)
+                        .is_some_and(|neuron| neuron.is_atom())
+                })
+                .copied()
+                .collect();
+            let bytes = if atoms.is_empty() {
+                target.decode_concept_members(&members)
+            } else {
+                target.decode_concept_members(&atoms)
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if validator.is_some_and(|accept| !accept(&bytes)) {
+                continue;
+            }
+            let candidate = (score, binding.use_count);
+            let entry = classes.entry(bytes).or_insert(candidate);
+            if candidate.0 > entry.0 || (candidate.0 == entry.0 && candidate.1 > entry.1) {
+                *entry = candidate;
+            }
+        }
+        let mut ranked: Vec<(Vec<u8>, f32, u64)> = classes
+            .into_iter()
+            .map(|(bytes, (score, uses))| (bytes, score, uses))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.cmp(&a.2))
+        });
+        let mut selected = 0usize;
+        let label_sets: Vec<std::collections::HashSet<String>> = ranked
+            .iter()
+            .map(|candidate| target.encoded_labels(&candidate.0).into_iter().collect())
+            .collect();
+        if let Some(top_labels) = label_sets.first().filter(|labels| !labels.is_empty()) {
+            let top_score = ranked[0].1;
+            for index in 1..ranked.len() {
+                let candidate_labels = &label_sets[index];
+                let is_close = top_score - ranked[index].1 <= 0.05;
+                let is_strict_superset = candidate_labels.len() > top_labels.len()
+                    && top_labels.is_subset(candidate_labels);
+                let is_richer_than_selected = candidate_labels.len() > label_sets[selected].len();
+                if is_close && is_strict_superset && is_richer_than_selected {
+                    selected = index;
+                }
+            }
+        }
+        let runner_score = if selected == 0 {
+            // A candidate carrying the SAME answer is not a rival.
+            //
+            // The margin exists to refuse a contested match -- two different
+            // answers scoring alike, where picking either is a guess. A
+            // textbook states the same section in several places, so the
+            // winner's own duplicate sat at rank 2 with an identical score
+            // and drove the margin to 0. Measured 2026-08-23: "the first law
+            // of thermodynamics" scored 1.0 and "What does the first law of
+            // thermodynamics state?" scored 0.789, both refused for want of
+            // separation from themselves.
+            //
+            // Comparing the decoded bytes settles it without a threshold:
+            // agreement between duplicates is evidence FOR an answer, and
+            // only a genuinely different answer can contest it.
+            // `ranked` can be empty here -- the surrounding code reaches this
+            // point before establishing that a winner exists, which is why
+            // the original used `.get(1)`. Indexing [0] directly panicked the
+            // whole chat path.
+            match ranked.first() {
+                Some((winner_bytes, _, _)) => ranked
+                    .iter()
+                    .skip(1)
+                    .find(|candidate| &candidate.0 != winner_bytes)
+                    .map(|candidate| candidate.1)
+                    .unwrap_or(0.0),
+                None => 0.0,
+            }
+        } else {
+            let selected_labels = &label_sets[selected];
+            ranked
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != selected)
+                .filter(|(index, _)| {
+                    let labels = &label_sets[*index];
+                    !labels.is_subset(selected_labels) && !selected_labels.is_subset(labels)
+                })
+                .map(|(_, candidate)| candidate.1)
+                .fold(0.0_f32, f32::max)
+        };
+        let (bytes, score, _) = ranked.into_iter().nth(selected)?;
+        let margin = score - runner_score;
+        // Require less separation as the winner approaches certainty.
+        //
+        // The margin refuses a CONTESTED match -- two unrelated candidates
+        // scoring alike, where picking either is a guess. That reasoning does
+        // not hold at the top of the range: measured 2026-08-23, "the first
+        // law of thermodynamics" scored 1.0 with margin 0.0 and was refused,
+        // because a textbook prints the same heading in more than one place
+        // and the answer's own duplicate tied it. Two spellings of one answer
+        // are agreement, not contest.
+        //
+        // Scaled by (1 - score) rather than switched off above a cutoff, so a
+        // weak match still faces the full requirement and there is no edge to
+        // sit exactly on.
+        let required_margin = min_margin * (1.0 - score).max(0.0);
+        (margin >= required_margin).then_some((bytes, score, margin))
+    }
+
+    fn best_binding_match_atom_tier(
+        &self,
+        query_pool: PoolId,
+        target_pool: Option<PoolId>,
+    ) -> BindingMatch {
+        let q_seq: Vec<NeuronId> = {
+            let q = match self.fabric.pool(query_pool) {
+                Some(p) => p,
+                None => return BindingMatch::NONE,
+            };
+            let q = q.read();
+            if !q
+                .currently_firing()
+                .any(|nid| q.get(nid).map_or(false, |n| n.is_atom()))
+            {
+                return BindingMatch::NONE;
+            }
+            let seq = q.last_observed_sequence();
+            if !seq.is_empty() {
+                seq.to_vec()
+            } else {
+                q.currently_firing()
+                    .filter(|nid| q.get(*nid).map_or(false, |n| n.is_atom()))
+                    .collect()
+            }
+        };
+        if q_seq.is_empty() {
+            return BindingMatch::NONE;
+        }
+
+        let bpid = self.binding_pool_id;
+        let bp = match self.fabric.pool(bpid) {
+            Some(p) => p,
+            None => return BindingMatch::NONE,
+        };
+        let candidate_ids = self.routed_binding_candidates(query_pool, target_pool);
+        let q_handle = match self.fabric.pool(query_pool) {
+            Some(p) => p,
+            None => return BindingMatch::NONE,
+        };
+        let q_read = q_handle.read();
+        let bp_read = bp.read();
+        let mut best = BindingMatch::NONE;
+        for n in candidate_ids
+            .iter()
+            .filter_map(|binding_id| bp_read.get(*binding_id))
+        {
+            if n.is_atom() {
+                continue;
+            }
+            let bind_query: Vec<NeuronId> = n
+                .members
+                .iter()
+                .filter(|m| {
+                    m.pool == query_pool
+                        && q_read.get(m.neuron).map_or(true, |qn| qn.is_atom())
+                })
+                .map(|m| m.neuron)
+                .collect();
+            if bind_query.is_empty() {
+                continue;
+            }
+            let intersect = bind_query
+                .iter()
+                .zip(q_seq.iter())
+                .filter(|(a, b)| a == b)
+                .count() as f32;
+            let precision = intersect / bind_query.len() as f32;
+            let recall = intersect / q_seq.len() as f32;
+            let candidate = BindingMatch {
+                precision,
+                recall,
+                tier: MatchTier::Atom,
+            };
+            if candidate.score() > best.score() {
+                best = candidate;
+            }
+        }
+        best
+    }
+
+    fn best_binding_match_concept_tier(
+        &self,
+        query_pool: PoolId,
+        target_pool: Option<PoolId>,
+    ) -> BindingMatch {
+        // Pre-collect:
+        //   - `firing_concepts`   — concepts that are currently firing
+        //   - `firing_atoms`      — atoms that are currently firing
+        //   - `concept_member_atoms` — atoms that are members of any
+        //                              firing concept (per §4.D.1 of
+        //                              ARCHITECTURE.md, these are
+        //                              concept-LAYER evidence not
+        //                              atom-LAYER noise)
+        let (firing_concepts, concept_member_atoms, firing_total) = {
+            let qp = match self.fabric.pool(query_pool) {
+                Some(p) => p,
+                None => return BindingMatch::NONE,
+            };
+            let q = qp.read();
+            let firing: Vec<NeuronId> = q.currently_firing().collect();
+            let firing_concepts: ahash::AHashSet<NeuronId> = firing
+                .iter()
+                .copied()
+                .filter(|nid| q.get(*nid).is_some_and(|neuron| !neuron.is_atom()))
+                .collect();
+            let firing_atoms: ahash::AHashSet<NeuronId> = firing
+                .iter()
+                .copied()
+                .filter(|nid| q.get(*nid).is_some_and(|neuron| neuron.is_atom()))
+                .collect();
+            // Atoms that belong to a firing concept's member set.  When a
+            // concept collapses from its constituent atoms during
+            // `Pool::observe_frame`, both the concept AND its atoms end
+            // up in `currently_firing`.  Counting those atoms as
+            // atom-layer noise would discard the trained sequence-precedence
+            // signal — the Stage 11A bug fixed here.
+            let mut concept_member_atoms: ahash::AHashSet<NeuronId> = ahash::AHashSet::new();
+            for &cid in &firing_concepts {
+                if let Some(c) = q.get(cid) {
+                    for m in &c.members {
+                        if m.pool == query_pool && firing_atoms.contains(&m.neuron) {
+                            concept_member_atoms.insert(m.neuron);
+                        }
+                    }
+                }
+            }
+            (firing_concepts, concept_member_atoms, firing.len())
+        };
+
+        if firing_concepts.is_empty() || firing_total == 0 {
+            return BindingMatch::NONE;
+        }
+
+        // §4.D.1 layer-aware coverage gate.
+        //
+        // OLD (Stage 11A, broken): concept_mass = firing_concepts /
+        // total_firing.  This treated atoms that are CONSTITUENTS of a
+        // firing concept as atom-layer noise, which discarded the
+        // sequence-precedence signal the substrate explicitly produces
+        // via `collapse_tail_to_concept`.
+        //
+        // NEW (§4.D.1): the concept layer's evidence INCLUDES both the
+        // concept neurons themselves and the atoms that belong to any
+        // firing concept's member set (i.e. atoms that just got
+        // collapsed UP into a concept).  Loose atoms — atoms firing
+        // that are NOT members of any firing concept — are the only
+        // atom-layer noise.
+        //
+        // Example for "apple": firing = {a, p, p, l, e atoms +
+        // apple-concept} = 6 things, concept_layer_evidence = 1 concept
+        // + 5 atoms-of-concept = 6, total = 6, ratio = 1.0.  Passes.
+        //
+        // Example for "ball is fun": firing = {b, a, l, l atoms +
+        // ball-concept + i, s, f, u, n loose atoms} = 11 things,
+        // concept_layer = 1 + 4 = 5, total = 11, ratio = 0.45.  Falls
+        // back to atom-tier — correct, because the query IS dominated
+        // by loose atoms.
+        let concept_layer_evidence = firing_concepts.len() + concept_member_atoms.len();
+        let layer_coverage = concept_layer_evidence as f32 / firing_total as f32;
+        if layer_coverage < 0.5 {
+            return BindingMatch::NONE;
+        }
+
+        let bpid = self.binding_pool_id;
+        let bp = match self.fabric.pool(bpid) {
+            Some(p) => p,
+            None => return BindingMatch::NONE,
+        };
+        let candidate_ids = self.routed_binding_candidates(query_pool, target_pool);
+        let query_handle = match self.fabric.pool(query_pool) {
+            Some(pool) => pool,
+            None => return BindingMatch::NONE,
+        };
+        let query = query_handle.read();
+        let bp_read = bp.read();
+        let mut best = BindingMatch::NONE;
+        for n in candidate_ids
+            .iter()
+            .filter_map(|binding_id| bp_read.get(*binding_id))
+        {
+            if n.is_atom() {
+                continue;
+            }
+            let bind_concepts: ahash::AHashSet<NeuronId> = n
+                .members
+                .iter()
+                .filter(|m| m.pool == query_pool)
+                .map(|m| m.neuron)
+                .filter(|nid| query.get(*nid).is_some_and(|neuron| !neuron.is_atom()))
+                .collect();
+            if bind_concepts.is_empty() {
+                continue;
+            }
+            let intersect = bind_concepts
+                .iter()
+                .filter(|a| firing_concepts.contains(a))
+                .count() as f32;
+            let precision = intersect / bind_concepts.len() as f32;
+            let recall = intersect / firing_concepts.len() as f32;
+            let candidate = BindingMatch {
+                precision,
+                recall,
+                tier: MatchTier::Concept,
+            };
+            if candidate.score() > best.score() {
+                best = candidate;
+            }
+        }
+        best
+    }
+
+    /// Stage 13A — resonant multi-pool extrusion (the "epoxy mould"
+    /// path per the architecture spec).  Where [`Self::integrate`]
+    /// retrieves one target concept from a single target pool via a
+    /// one-pass propagation, `integrate_resonant` runs
+    /// [`Fabric::settle`] (iterative fixed-point with sharpening)
+    /// then reads the top-N decoded concepts in *every* requested
+    /// target pool simultaneously.
+    ///
+    /// This is the substrate-level support for "fire a constraint
+    /// into the substrate, extrude the coherent multi-pool state."
+    /// Categorical retrieval (`integrate`) is unchanged and remains
+    /// the contract for `/chat`.
+    ///
+    /// `top_per_pool`: how many concepts to decode per target pool.
+    /// `max_iter`/`eps`: settling parameters; see `Fabric::settle`.
+    pub fn integrate_resonant(
+        &self,
+        query_pool: PoolId,
+        target_pools: &[PoolId],
+        top_per_pool: usize,
+        max_iter: usize,
+        eps: f32,
+    ) -> ResonantExtrusion {
+        let settle = self.fabric.settle(
+            query_pool,
+            max_iter,
+            /*top_k for sharpening*/ top_per_pool.max(8),
+            eps,
+        );
+
+        let mut per_pool: Vec<PoolExtrusion> = Vec::with_capacity(target_pools.len());
+        for &tp in target_pools {
+            let pool_handle = match self.fabric.pool(tp) {
+                Some(p) => p,
+                None => {
+                    per_pool.push(PoolExtrusion {
+                        pool: tp,
+                        decoded: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+            let pool = pool_handle.read();
+
+            // Build a fast lookup of the settled atom activations in
+            // this pool (raw output of the fixed-point iteration).
+            let empty: ahash::AHashMap<NeuronId, f32> = ahash::AHashMap::new();
+            let atom_acts = settle.pool_activations.get(&tp).unwrap_or(&empty);
+
+            // Rank CONCEPTS by their average-member-activation derived
+            // from the settled atom state (the same idea integrate()
+            // uses to score concept candidates).  Cross-pool axons
+            // target atoms, not concepts, so to read a coherent
+            // concept-level extrusion we have to compose it from the
+            // member atoms' settled activations.
+            //
+            // For each concept neuron in the target pool: compute
+            // avg(member activations).  Atoms get their settled
+            // activation directly.  The combined list is sorted
+            // descending; we take the top `top_per_pool`.
+            let mut ranked: Vec<(NeuronId, f32, bool)> = Vec::new(); // (id, score, is_concept)
+            for n in pool.iter_neurons() {
+                if n.is_atom() {
+                    let act = atom_acts.get(&n.id).copied().unwrap_or(0.0);
+                    if act > 0.001 {
+                        ranked.push((n.id, act, false));
+                    }
+                } else {
+                    let in_pool_members: Vec<NeuronId> = n
+                        .members
+                        .iter()
+                        .filter(|m| m.pool == tp)
+                        .map(|m| m.neuron)
+                        .collect();
+                    if in_pool_members.is_empty() {
+                        continue;
+                    }
+                    let sum: f32 = in_pool_members
+                        .iter()
+                        .map(|nid| atom_acts.get(nid).copied().unwrap_or(0.0))
+                        .sum();
+                    let avg = sum / in_pool_members.len() as f32;
+                    if avg > 0.001 {
+                        // Concept score includes a small bonus for
+                        // longer concepts (sqrt of length) so that
+                        // when atom activations are similar, the
+                        // larger emergent unit wins over its atoms.
+                        // This matches the spirit of integrate()'s
+                        // length factor.
+                        let length_bonus = (in_pool_members.len() as f32).sqrt();
+                        ranked.push((n.id, avg * length_bonus, true));
+                    }
+                }
+            }
+            // Concepts first by their composed score, then atoms.
+            // The is_concept flag lets us tiebreak: concept > atom
+            // at the same score so emergent units are surfaced.
+            ranked.sort_by(|a, b| {
+                let s = b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+                if s == std::cmp::Ordering::Equal {
+                    return b.2.cmp(&a.2);
+                }
+                s
+            });
+            ranked.truncate(top_per_pool);
+
+            let mut decoded: Vec<DecodedConcept> = Vec::with_capacity(ranked.len());
+            for (nid, score, _is_concept) in ranked {
+                let neuron = match pool.get(nid) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let bytes: Vec<u8> = if neuron.is_atom() {
+                    pool.encoding_reassemble(&[(neuron.label.as_str(), 1.0)])
+                } else {
+                    pool.decode_concept_members(&neuron.members)
+                };
+                decoded.push(DecodedConcept {
+                    neuron: NeuronRef::new(tp, nid),
+                    activation: score,
+                    label: neuron.label.clone(),
+                    bytes,
+                });
+            }
+            per_pool.push(PoolExtrusion { pool: tp, decoded });
+        }
+
+        ResonantExtrusion {
+            iterations_run: settle.iterations_run,
+            converged: settle.converged,
+            pools: per_pool,
+        }
+    }
+
+    /// Critical-thinking integration.  When fabric retrieval has low
+    /// confidence, walks the EEM's grounded-fact graph from the
+    /// query's firing concepts to find target-pool concepts reachable
+    /// via co-firing chains.  Returns an `AnswerWithGrounding` whose
+    /// `answer` is the strongest reached target-pool concept's decoded
+    /// bytes, or `None` (with `outside_grounding=true`) when no chain
+    /// converges or the prompt is out-of-vocabulary.
+    ///
+    /// `fabric_confidence_threshold`: below this, the EEM chain path
+    /// runs.  Above, the fabric result is returned directly.
+    /// `chain_max_depth`: how many hops the ivy-growth walk takes.
+    /// `chain_max_visit`: cap on total facts traversed (bounds work).
+    /// `binding_match_threshold`: precision floor for trusting the
+    /// fabric answer.  When the best binding's query-pool member set
+    /// has < this precision against the firing query atoms, the
+    /// prompt is treated as out-of-vocabulary regardless of what
+    /// fabric returns (prevents "Hello → color" hallucinations).
+    /// Ask one question of the trained bindings without learning anything
+    /// from it: how well the brain knows this question, and what it answers.
+    ///
+    /// [`Self::observe_fabric_read_only`] rather than
+    /// [`Self::observe_read_only`] because this runs hundreds of times per
+    /// derivation. `Brain::observe` also inserts a `recent_frames` entry and
+    /// captures a QA pair, and a QA pair harvested from a question the brain
+    /// invented for itself is training nobody asked for — the exact class of
+    /// growth `observe_read_only` was added to stop.
+    fn probe_question(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        question: &[u8],
+    ) -> (f32, Option<Vec<u8>>) {
+        let score = self.probe_question_score(query_pool, target_pool, question);
+        (score, self.probe_answer(query_pool, target_pool))
+    }
+
+    /// The score half of [`Self::probe_question`], without decoding an answer.
+    ///
+    /// Both searches inside `derive_by_substitution_profiled` test the SCORE
+    /// first and read the answer only for the probe that wins, so decoding
+    /// every probe is work whose result is thrown away. Measured by counting
+    /// the calls rather than by reasoning about them: a 2-hop derivation at
+    /// scale 16 ran ~16 probes per hop and used the answer of 1 of them, so
+    /// the decode ran 15 times for nothing. Splitting the two halves changes
+    /// no result — [`Self::probe_answer`] decodes from the activation this
+    /// method leaves behind, which is exactly the state the combined version
+    /// decoded from.
+    fn probe_question_score(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        question: &[u8],
+    ) -> f32 {
+        self.observe_fabric_read_only(query_pool, question);
+        // The exact ordered route, not just the per-byte feature postings:
+        // see `best_binding_match_routed` for why the cap made an early
+        // room's taught sub-question unreachable from the score half alone.
+        self.best_binding_match_routed(query_pool, Some(target_pool))
+            .score()
+    }
+
+    /// Decode the answer for whatever question was last probed into
+    /// `query_pool`. Must follow a [`Self::probe_question_score`] on the same
+    /// pool: it reads the firing state that call installed.
+    fn probe_answer(&mut self, query_pool: PoolId, target_pool: PoolId) -> Option<Vec<u8>> {
+        self.decode_best_trained_binding(query_pool, target_pool)
+            .filter(|a| !a.is_empty())
+    }
+
+    /// Derive an answer to a question the brain was NEVER trained on, by
+    /// composing questions it WAS.
+    ///
+    /// # Why this is not the EEM chain walk
+    ///
+    /// The design on paper is that integration comes from
+    /// [`Eem::chain_explore`] over grounded facts. Measured
+    /// (`crates/brain/tests/eem_chain_bridge.rs`), that cannot work as built,
+    /// and the reason is a type error in what a fact's members are:
+    ///
+    /// * Ordinary training registers **0** facts — `register_fact` has one
+    ///   production caller, inside the Tier-2 consolidated arm of
+    ///   [`Self::register_fingerprint`], and `pretrain_binding_episode` never
+    ///   reaches it.
+    /// * Populating the graph by hand the way that arm would does not help.
+    ///   32 facts over a 16-room two-hop world share only **30 distinct
+    ///   members**, 7 of which appear in *every* fact, because an atom is a
+    ///   BYTE: every fact shares a space and a digit with every other, so the
+    ///   fact graph is a complete graph rather than a chain.
+    /// * The walk therefore returns everything at one confidence. Measured on
+    ///   a never-trained probe: 25 reached members, 4 in the answer pool, and
+    ///   **one** distinct confidence among them (`1.0000`), because confidence
+    ///   is a product of fact confidences and every fact is 1.0. The refs of
+    ///   the CORRECT answer were reached 1 of 3; the refs of the DISTRACTOR
+    ///   were reached 4 of 4. The wrong answer is reached more completely than
+    ///   the right one.
+    ///
+    /// So registering facts on the pretrain path — the obvious repair, and one
+    /// a previous pass measured at 5.3 MB for 0 integration — is inert by
+    /// construction, not by accident.
+    ///
+    /// # What this does instead
+    ///
+    /// Composition over the questions themselves, verified by recall. The
+    /// brain already answers a trained question perfectly (recall is 100 %),
+    /// so recall is the one reliable primitive available, and integration is
+    /// that primitive applied to its own output:
+    ///
+    /// 1. Ask the untrained question. The best trained binding answers the
+    ///    sub-question it *does* cover — for `"r03 lamp on material"` that is
+    ///    `"r03 lamp on"`, answering `"desk"`.
+    /// 2. Substitute that answer for each contiguous span of the question and
+    ///    ask every rewrite. One of them, `"r03 desk material"`, is a question
+    ///    the brain was actually taught.
+    /// 3. Keep the rewrite the brain knows strictly BETTER than the original,
+    ///    by [`BindingMatch::score`] (precision × recall). That is the whole
+    ///    acceptance test, and it needs no new threshold: the original scores
+    ///    below 1 precisely because part of it is unexplained, and a rewrite
+    ///    that explains all of it scores above. Its answer is the derivation.
+    /// 4. Recurse, so an `n`-hop question costs `n` substitutions.
+    ///
+    /// Nothing here reads the wording. There is no separator, no token, no
+    /// substitution table and no per-family rule; the operation is "the answer
+    /// to a sub-question replaces that sub-question's text in place, and the
+    /// result is the next question", and the brain's own trained knowledge is
+    /// the only thing that decides which rewrite is valid. A question that
+    /// yields no better-known rewrite derives nothing and returns `None`,
+    /// which is the honest answer rather than a guess.
+    ///
+    /// `max_probes` bounds total work exactly as `chain_max_visit` bounds the
+    /// walk, so the caller sizes the budget and never discovers the cost at
+    /// runtime. The cost itself has two regimes: when the taught sub-question
+    /// is a PREFIX of the asked one it is found by its score alone (a question
+    /// scoring 1.0 is one the brain was taught) and only the splice point
+    /// varies, which is `~2k` questions; otherwise the full span search runs at
+    /// `n(n+1)/2`. Read the count off `derive_by_substitution_profiled` rather
+    /// than off either formula.
+    ///
+    /// The caller's query activation is restored before returning, because
+    /// every later stage of the answer path reads the firing state and this
+    /// method has overwritten it hundreds of times.
+    pub fn derive_by_substitution(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        query: &[u8],
+        max_depth: usize,
+        max_probes: usize,
+    ) -> Option<Vec<u8>> {
+        self.derive_by_substitution_profiled(query_pool, target_pool, query, max_depth, max_probes)
+            .0
+    }
+
+    /// [`Self::derive_by_substitution`], also reporting how many questions it
+    /// had to ask. The cost is the thing that decides whether this can run on
+    /// the answer path at corpus scale, so it is measurable rather than
+    /// inferred from `n(n+1)/2`.
+    pub fn derive_by_substitution_profiled(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        query: &[u8],
+        max_depth: usize,
+        max_probes: usize,
+    ) -> (Option<Vec<u8>>, usize) {
+        let (answer, probes, _) = self.derive_by_substitution_profiled_with_status(
+            query_pool,
+            target_pool,
+            query,
+            max_depth,
+            max_probes,
+        );
+        (answer, probes)
+    }
+
+    /// [`Self::derive_by_substitution_profiled`] with its taught sub-question
+    /// verdict included in the result.
+    pub fn derive_by_substitution_profiled_with_status(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        query: &[u8],
+        max_depth: usize,
+        max_probes: usize,
+    ) -> (Option<Vec<u8>>, usize, Option<bool>) {
+        if query.is_empty() || query_pool == target_pool || max_depth == 0 {
+            self.derivation_last_continuations = None;
+            self.derivation_found_taught_subquestion = None;
+            return (None, 0, None);
+        }
+        self.derivation_found_taught_subquestion = None;
+        self.derivation_stats.attempts += 1;
+        let mut probes = 0usize;
+        let mut current = query.to_vec();
+        let mut derived: Option<Vec<u8>> = None;
+        let mut found_taught_subquestion = false;
+        // How many hops walked to a rewrite the brain was NEVER taught. See
+        // `derivation_last_continuations`: it is set from this at every return,
+        // including the early ones, so a reader can never see a count left
+        // behind by a previous call.
+        let mut continuations = 0usize;
+        let mut starved_before_verdict = false;
+        let mut completed_subquestion_scan = false;
+
+        for _hop in 0..max_depth {
+            if probes >= max_probes {
+                starved_before_verdict = true;
+                break;
+            }
+            probes += 1;
+            let (base_score, base_answer) =
+                self.probe_question(query_pool, target_pool, &current);
+            let Some(base_answer) = base_answer else { break };
+            // A question the brain already knows PERFECTLY cannot be improved
+            // on, because the acceptance test is "strictly better known than
+            // this one" and 1.0 is the ceiling. Stopping here is what makes the
+            // LAST hop free: without it the terminal hop of every derivation
+            // ran a full span search that could not win by construction, which
+            // measured as 161 questions per 2-hop derivation against the 26 the
+            // productive hop actually needs.
+            if base_score >= 1.0 {
+                if self.is_trained_frame(query_pool, &current) {
+                    found_taught_subquestion = true;
+                    self.derivation_found_taught_subquestion = Some(true);
+                }
+                break;
+            }
+
+            let n = current.len();
+
+            // Which spans are worth rewriting?
+            //
+            // The general answer is "all of them", which is n(n+1)/2 questions
+            // and measured at 353 per 2-hop derivation — far too many to run on
+            // an answer path that already asks 3,456 integration questions at
+            // scale 64.
+            //
+            // A ceiling score identifies a candidate sub-question cheaply, but
+            // it is not proof that the ordered frame was taught: the binding
+            // score compares an unordered byte set. Count a candidate as taught
+            // only when `is_trained_frame` also confirms its exact frame. Once
+            // the deletion fixes the sub-question cut `k`, only the splice
+            // position `j` varies: `k + (k+1)` probes instead of
+            // `n(n+1)/2`.
+            //
+            // The full span search stays as the fallback, so a world whose
+            // sub-questions are not prefix-shaped still derives; it just costs
+            // what it always did.
+            // A PREFIX is the wrong shape, and that was measured rather than
+            // reasoned. Scoring every prefix of `"r000 lamp on material?"`
+            // against a world whose trained questions all end in `?` gives
+            // 1:0.12 … 11:0.80 12:0.90 13:0.90 14:0.90 15:0.90 16:0.81 …
+            // 21:0.76 — the peak is 0.90 and NOTHING reaches 1.0, because the
+            // taught sub-question is `"r000 lamp on?"` and every prefix either
+            // lacks the terminator or carries text past it. So all `n-1` probes
+            // were spent to find nothing, which is why `on_material` (1,536 of
+            // 3,456 probes at scale 64) sat at 0 under any budget.
+            //
+            // The general shape is a DELETION, not a prefix: the taught
+            // sub-question is this question with a contiguous middle span
+            // removed, `current[..k] ++ current[n-t..]`, and `t == 0` is the
+            // prefix case. Searching every deletion is `n(n+1)/2`. `t <= 1` is
+            // a BUDGET, not a grammar — it reaches a one-byte terminator and no
+            // more, and a longer one needs `t <= 2` at `3(n-1)` probes, which
+            // does not fit 32 at `n = 22`. Nothing here reads the byte: a
+            // terminator is not recognised, it is whatever the tail turns out
+            // to be.
+            //
+            // `k` outer and `t` inner, because the order decides whether this
+            // fits. Scanning all of `t = 0` and then all of `t = 1` finds the
+            // hit at probe 33; interleaved it lands at 25, inside a ceiling of
+            // 32 with ~13 left for the splice.
+            const MAX_DELETION_TAIL: usize = 1;
+            let mut known_prefix: Option<(usize, Vec<u8>)> = None;
+            // The cuts that have worked before, at one question each. See
+            // `derivation_cut_hints`: this can only REORDER the search, never
+            // widen it, because the acceptance test below is the same `>= 1.0`
+            // the full scan uses.
+            let mut sub_question_settled = false;
+            for (hint_n, k, t) in self.derivation_cut_hints.clone() {
+                if probes >= max_probes {
+                    starved_before_verdict = true;
+                    break;
+                }
+                if hint_n != n {
+                    continue;
+                }
+                let mut sub = Vec::with_capacity(k + t);
+                sub.extend_from_slice(&current[..k]);
+                sub.extend_from_slice(&current[n - t..]);
+                probes += 1;
+                self.derivation_stats.cut_hint_probes += 1;
+                // Score first: the answer is read only by the `>= 1.0` arm, so
+                // decoding every miss is work nothing consumes.
+                let score = self.probe_question_score(query_pool, target_pool, &sub);
+                if score >= 1.0 && self.is_trained_frame(query_pool, &sub) {
+                    found_taught_subquestion = true;
+                    self.derivation_found_taught_subquestion = Some(true);
+                    self.derivation_stats.cut_hint_hits += 1;
+                    if let Some(answer) = self.probe_answer(query_pool, target_pool) {
+                        known_prefix = Some((k, answer));
+                        self.note_derivation_cut(n, k, t);
+                    }
+                    sub_question_settled = true;
+                    break;
+                }
+            }
+            if !sub_question_settled {
+                'deletion: for k in 1..n {
+                    for t in 0..=MAX_DELETION_TAIL.min(n - k) {
+                        if probes >= max_probes {
+                            starved_before_verdict = true;
+                            break 'deletion;
+                        }
+                        // `n - t == k` deletes nothing, so the probe would
+                        // re-ask `current`, whose score is already
+                        // `base_score`.
+                        if t > 0 && n - t == k {
+                            continue;
+                        }
+                        let mut sub = Vec::with_capacity(k + t);
+                        sub.extend_from_slice(&current[..k]);
+                        sub.extend_from_slice(&current[n - t..]);
+                        probes += 1;
+                        let score = self.probe_question_score(query_pool, target_pool, &sub);
+                        if score >= 1.0 && self.is_trained_frame(query_pool, &sub) {
+                            found_taught_subquestion = true;
+                            self.derivation_found_taught_subquestion = Some(true);
+                            if let Some(answer) = self.probe_answer(query_pool, target_pool) {
+                                known_prefix = Some((k, answer));
+                                self.note_derivation_cut(n, k, t);
+                            }
+                            break 'deletion;
+                        }
+                    }
+                }
+            }
+            if !starved_before_verdict {
+                completed_subquestion_scan = true;
+            }
+
+            // WHICH ceiling rewrite, and why this is a vote rather than the
+            // first one.
+            //
+            // The accept rule this method was built on -- "a question scoring
+            // 1.0 IS a question the brain was taught" -- is FALSE, and the
+            // measurement is Cove's, in `tests/relation_transfer_derivation.rs`:
+            // 184 rewrites reached the ceiling over 24 `on_material` probes and
+            // 24 of them were actually taught. An atom is a BYTE, so a
+            // truncation that drops one byte of the room id still explains
+            // every atom it kept and still scores 1.0 -- `"r0desk material?"`
+            // from `"r001 lamp on material?"` reaches the ceiling and answers
+            // r000's material. Taking the FIRST such rewrite takes that one.
+            //
+            // The ceiling answers are not evenly wrong, though: five of the
+            // seven kept the room id and said `steel`, two lost a byte and said
+            // `oak`. So the MODAL answer over every ceiling rewrite is the one
+            // the truncations cannot outvote, and that is the whole rule -- no
+            // byte is read, no span is preferred, and nothing here knows what a
+            // room id is. Measured by Cove at scale 1: `on_material` 6/24 ->
+            // 18/24, `next_color` 16/16 unchanged (its correct rewrite is
+            // `j = 0`, the MOST truncated one, so a rule that preferred long
+            // spans would have cost it), all families 22/54 -> 34/54.
+            //
+            // Ties break on the smallest `j`, so the result is deterministic
+            // and a tie reduces to the old first-wins behaviour.
+            let cut_k = known_prefix.as_ref().map(|(k, _)| *k);
+            let splice_answer = match &known_prefix {
+                Some((_, answer)) => answer.clone(),
+                None => base_answer.clone(),
+            };
+
+            // The ceiling set remembered for this shape is replayed FIRST, and
+            // the rest of the scan runs only if it produced no ceiling. A hint
+            // therefore collapses a repeat from `k + 1` questions to the size
+            // of the set while still handing the vote every ceiling answer --
+            // caching only the first `j`, which is what this cache did before
+            // the vote existed, would have made 18/24 unreachable.
+            let mut rounds: Vec<Vec<(usize, usize)>> = Vec::new();
+            match cut_k {
+                Some(k) => {
+                    let hint = self.derivation_splice_hint(n, k);
+                    if hint.is_empty() {
+                        rounds.push((0..=k).map(|j| (j, k)).collect());
+                    } else {
+                        rounds.push(hint.iter().map(|j| (*j, k)).collect());
+                        rounds
+                            .push((0..=k).filter(|j| !hint.contains(j)).map(|j| (j, k)).collect());
+                    }
+                }
+                None => {
+                    let mut all = Vec::new();
+                    for j in 0..n {
+                        for k in (j + 1)..=n {
+                            all.push((j, k));
+                        }
+                    }
+                    rounds.push(all);
+                }
+            }
+
+            // Every rewrite that reached the ceiling, as `(j, k, answer)`.
+            let mut ceiling: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+            // The best SUB-ceiling rewrite, which is what answers when nothing
+            // reaches 1.0 -- unchanged behaviour for that case.
+            let mut best: Option<(f32, Vec<u8>, Vec<u8>)> = None;
+            // The best rewrite the brain was NEVER taught, kept as a next
+            // QUESTION and never as an answer.
+            //
+            // An n-hop question's intermediate question is untrained by
+            // construction -- that is what makes it an integration probe
+            // rather than a recall probe. `"r000 next lamp on material?"`
+            // rewrites to `"r001 lamp on material?"`, which is itself a
+            // held-out probe, and only the hop AFTER it reaches the taught
+            // `"r001 desk material?"`. So requiring every rewrite to be taught
+            // is correct for the ANSWER and fatal for the SEARCH: measured, it
+            // took `next_on_material` from 1/8, 5/32 and 20/128 to 0 at every
+            // scale while taking the other families up.
+            //
+            // Splitting the two roles costs nothing in honesty. An untaught
+            // rewrite can advance `current` but cannot assign `derived`, so
+            // every answer this method returns still comes from a question the
+            // brain was taught; the chain is merely allowed to walk through
+            // questions it was not. A chain that never reaches a taught
+            // question returns `None`.
+            let mut continuation: Option<(f32, Vec<u8>)> = None;
+            for (round_idx, spans) in rounds.into_iter().enumerate() {
+                // The hint round answered, so the rest of the scan is work
+                // whose result the vote already has.
+                if round_idx > 0 && !ceiling.is_empty() {
+                    break;
+                }
+                for (j, k) in spans {
+                    if probes >= max_probes {
+                        if cut_k.is_some() {
+                            starved_before_verdict = true;
+                        }
+                        break;
+                    }
+                    let mut rewrite = Vec::with_capacity(n + splice_answer.len());
+                    rewrite.extend_from_slice(&current[..j]);
+                    rewrite.extend_from_slice(&splice_answer);
+                    rewrite.extend_from_slice(&current[k..]);
+                    if rewrite == current || rewrite.is_empty() {
+                        continue;
+                    }
+                    probes += 1;
+                    let score = self.probe_question_score(query_pool, target_pool, &rewrite);
+                    // Positional agreement in `best_binding_match_atom_tier`
+                    // reaches 1.0 only when both lengths and every position
+                    // match the stored binding sequence.
+                    let taught = score >= 1.0;
+                    if !taught {
+                        self.derivation_stats.rejected_untaught += 1;
+                        // Not an answer, but possibly the next question. Same
+                        // selection rule the answer arm uses -- best score
+                        // strictly above the question we came from -- and no
+                        // decode, because nothing reads this rewrite's answer.
+                        if score > base_score
+                            && continuation.as_ref().map_or(true, |(c, _)| score > *c)
+                        {
+                            continuation = Some((score, rewrite));
+                        }
+                        continue;
+                    }
+                    // `base_score < 1.0` is guaranteed by the break above, so a
+                    // ceiling rewrite is always strictly better known than the
+                    // question it came from.
+                    if score >= 1.0 {
+                        if let Some(answer) = self.probe_answer(query_pool, target_pool) {
+                            ceiling.push((j, k, answer));
+                        }
+                        // NO break: the vote needs every ceiling answer, and
+                        // this line is what the 6/24 -> 18/24 is bought with.
+                        continue;
+                    }
+                    // Strictly better-known than the question we started from,
+                    // and the best such rewrite found. Tested BEFORE the
+                    // decode, because a rewrite that is not the new best has
+                    // its answer discarded.
+                    if score > base_score
+                        && best.as_ref().map_or(true, |(best_score, _, _)| score > *best_score)
+                    {
+                        let Some(answer) = self.probe_answer(query_pool, target_pool) else {
+                            continue;
+                        };
+                        best = Some((score, rewrite, answer));
+                    }
+                }
+            }
+
+            if !ceiling.is_empty() {
+                // Prefer rewrites whose answer differs from the un-rewritten base_answer.
+                // An answer that echoes base_answer repeats the unintegrated surface fact
+                // rather than deriving a grounded step. When differing rewrites exist,
+                // the vote is conducted over them; otherwise the full ceiling set is used.
+                let differing: Vec<_> = ceiling
+                    .iter()
+                    .filter(|(_, _, answer)| answer != &base_answer)
+                    .cloned()
+                    .collect();
+                let candidates = if !differing.is_empty() {
+                    &differing
+                } else {
+                    &ceiling
+                };
+
+                // Modal answer; ties on the smallest `j`.
+                let mut tally: Vec<(&[u8], usize, usize, usize)> = Vec::new();
+                for (j, k, answer) in candidates {
+                    match tally.iter_mut().find(|(a, _, _, _)| *a == answer.as_slice()) {
+                        Some(entry) => entry.1 += 1,
+                        None => tally.push((answer.as_slice(), 1, *j, *k)),
+                    }
+                }
+                tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+                let majority = tally[0].1 * 2 > candidates.len();
+                let (winner, _, win_j, win_k) = if majority {
+                    tally[0]
+                } else {
+                    *tally
+                        .iter()
+                        .min_by_key(|(_, _, j, _)| *j)
+                        .expect("candidates is non-empty")
+                };
+                let winner = winner.to_vec();
+                let mut rewrite = Vec::with_capacity(n + splice_answer.len());
+                rewrite.extend_from_slice(&current[..win_j]);
+                rewrite.extend_from_slice(&splice_answer);
+                rewrite.extend_from_slice(&current[win_k..]);
+                if let Some(k) = cut_k {
+                    let mut js: Vec<usize> = ceiling.iter().map(|(j, _, _)| *j).collect();
+                    js.sort_unstable();
+                    js.dedup();
+                    self.note_derivation_splice(n, k, js);
+                }
+                best = Some((1.0, rewrite, winner));
+            }
+            match best {
+                // A taught rewrite: its answer IS the derivation.
+                Some((_, next_question, next_answer)) => {
+                    derived = Some(next_answer);
+                    current = next_question;
+                }
+                // Nothing taught at this hop. Walk to the best untaught
+                // rewrite and try again, WITHOUT recording an answer -- see
+                // `continuation`. `derived` keeps whatever an earlier taught
+                // hop established, or stays `None`.
+                None => match continuation {
+                    Some((_, next_question)) => {
+                        // A hop into a question the brain was never taught. By
+                        // the arm's own doc that is an INTERMEDIATE question,
+                        // which only a composition has, so the counter remains
+                        // useful diagnostic information. The transfer gate
+                        // uses the separate taught-sub-question verdict.
+                        continuations += 1;
+                        current = next_question;
+                    }
+                    None => break,
+                },
+            }
+        }
+
+        if found_taught_subquestion {
+            self.derivation_found_taught_subquestion = Some(true);
+        } else if completed_subquestion_scan && !starved_before_verdict {
+            self.derivation_found_taught_subquestion = Some(false);
+        }
+        self.observe_fabric_read_only(query_pool, query);
+        // The continuation count remains diagnostic. It is not a proof that
+        // the deletion scan found or did not find an exact taught question;
+        // the status returned above carries that separate verdict.
+        //
+        // When the deletion scan finishes (`!starved_before_verdict`) with no
+        // taught sub-question (`cut_k == None`), its fallback `None =>` loop
+        // over all `n(n+1)/2` spans of `base_answer` may exhaust `max_probes`,
+        // but the sub-question verdict is already complete: no taught
+        // sub-question exists in `current`.
+        self.derivation_last_continuations = if derived.as_ref().map_or(true, |a| a.is_empty())
+            && starved_before_verdict
+        {
+            None
+        } else {
+            Some(continuations)
+        };
+        self.derivation_stats.probes += probes;
+        match derived.as_ref().filter(|a| !a.is_empty()) {
+            Some(_) => self.derivation_stats.answered += 1,
+            // Starvation, not refusal: the loop stopped because the budget
+            // ran out rather than because no rewrite was better known. These
+            // are the calls a larger budget would convert, and they are the
+            // only reason to raise one.
+            None if probes >= max_probes => self.derivation_stats.budget_exhausted += 1,
+            None => {}
+        }
+        (derived, probes, self.derivation_found_taught_subquestion)
+    }
+
+    /// What the derivation has cost this brain so far. See [`DerivationStats`]
+    /// for why this is counted rather than computed from the question length.
+    pub fn derivation_stats(&self) -> DerivationStats {
+        self.derivation_stats
+    }
+
+    /// Default-threshold version of [`Self::integrate_autonomous_tuned`],
+    /// plus the derivation fallback that makes it answer questions it was
+    /// never trained on.
+    ///
+    /// Uses 0.70 as the binding-match precision floor — sufficient to
+    /// reject out-of-vocabulary prompts (like "Hello" against a
+    /// toddler-category brain) while still accepting partial-match
+    /// prompts ("doggy" → animal, "blue!" → color).
+    ///
+    /// # Why the derivation hangs off THIS method and takes no question
+    ///
+    /// [`Self::derive_by_substitution`] measured 32 of 32 on never-trained
+    /// probes and had **zero callers** outside its own test: the answer path
+    /// arrives here with two pool ids and no question, because the question
+    /// was consumed by an earlier `observe_read_only`. It cannot be recovered
+    /// from the firing set — an atom is a BYTE, the firing set is an unordered
+    /// set of distinct bytes, and `"r03 lamp on material"` fires exactly what
+    /// an anagram of it fires.
+    ///
+    /// [`Self::observe`] already keeps the frame in `recent_frames` keyed by
+    /// pool, with the tick it arrived on, for QA capture. That is the question,
+    /// already stored, so the derivation needs no new state and no new
+    /// argument — it needs the bytes this brain already has. The 2-tick
+    /// freshness window is the one `observe`'s own QA capture uses, so a
+    /// caller that asks without observing derives nothing rather than deriving
+    /// an answer to a stale question.
+    ///
+    /// # Why this cannot cost OOV honesty
+    ///
+    /// The derivation runs only when `integrate_autonomous_tuned` produced no
+    /// answer AND the step-0 binding gate accepts the prompt at the same 0.70
+    /// precision floor that gate uses.
+    ///
+    /// The gate is re-read here rather than inferred from the returned
+    /// `confidence_tier`, and that is not defensive duplication — measured, the
+    /// tier cannot carry it. `Ungrounded` comes back for prompts the gate
+    /// ACCEPTED: with `fabric_confidence_threshold` at 100.0 the fabric arm is
+    /// never taken and the chain walk reaches nothing, so the method returns
+    /// the legacy `integrate()` report, whose `fabric_confidence` is 0.0 and
+    /// whose tier is therefore `Ungrounded`. A first version of this fallback
+    /// read that tier and was inert for exactly that reason: 0 of 32 TRAINED
+    /// questions answered through this entry point while
+    /// `best_binding_match_v2` scored every one of them at precision 1.0000,
+    /// recall 1.0000, tier `Atom`. The gate is the only thing that owns "is
+    /// this prompt grounded" — the audit-4 rule in
+    /// `integrate_autonomous_tuned` says so — so the gate is what is read.
+    pub fn integrate_autonomous(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        fabric_confidence_threshold: f32,
+        chain_max_depth: usize,
+        chain_max_visit: usize,
+    ) -> AnswerWithGrounding {
+        let direct = self.integrate_autonomous_tuned(
+            query_pool,
+            target_pool,
+            fabric_confidence_threshold,
+            chain_max_depth,
+            chain_max_visit,
+            0.70,
+        );
+        if direct.answer.as_ref().map_or(false, |a| !a.is_empty()) {
+            return direct;
+        }
+        // Clear the previous query's diagnostics and verdict before any early
+        // return. A missing verdict on this query is not evidence that no taught
+        // sub-question exists.
+        self.derivation_last_continuations = None;
+        self.derivation_found_taught_subquestion = None;
+        if self.derivation_probe_budget == 0 {
+            return direct;
+        }
+        // Same gate, same floor, same single source of truth as step 0.
+        if self.best_binding_match_v2(query_pool).precision < 0.70 {
+            return direct;
+        }
+        let Some(question) = self.fresh_observed_frame(query_pool) else {
+            return direct;
+        };
+        let (derived, _probes, subquestion_status) =
+            self.derive_by_substitution_profiled_with_status(
+                query_pool,
+                target_pool,
+                &question,
+                chain_max_depth,
+                self.derivation_probe_budget,
+            );
+        // SUBSTITUTION FAILED, SO TRY THE ONE OTHER DERIVATION IN THE LIBRARY.
+        //
+        // `derive_by_substitution` can only splice spans taken from an ANSWER.
+        // A held-out probe of the shape `<subject> <relation>?` needs a span
+        // that only ever appears inside a trained QUESTION, which is why the
+        // separate relation-transfer mechanism exists.
+        // `crate::relation_transfer` supplies exactly that span and nothing
+        // else; see its module doc for why alignment alone cannot.
+        //
+        // The scorecard (`examples/scorecard.rs`) and node's composed answer
+        // route (`brain_api.rs`) both reach this derivation, keeping the
+        // measurement and product on the same status gate.
+        //
+        // IT MAY ONLY SPEND ON A SILENCE. The arm runs only when substitution
+        // returned nothing, so no answer the brain already derives can change
+        // and no probe is spent on a question that is already answered. The
+        // cost lands on the empty bucket alone.
+        //
+        // AND IT MAY ONLY SPEND ON A COMPLETED NEGATIVE SEARCH. The profiled
+        // derivation reports `Some(false)` only after its deletion scan
+        // completes without finding an exact ordered taught sub-question.
+        // `Some(true)` means a taught sub-question was found; `None` means the
+        // scan did not establish either result (for example, it starved).
+        // Only the completed negative result licenses borrowing a relation.
+        // This keeps the transfer away from compositions whose intermediate
+        // question the production derivation already found, without using a
+        // family name or hop-count heuristic.
+        let derived = match derived.filter(|a| !a.is_empty()) {
+            Some(derived) => derived,
+            None if !self.relation_transfer_in_answer_path => return direct,
+            None if subquestion_status != Some(false) => return direct,
+            None => {
+                let (transferred, transfer_probes) =
+                    crate::relation_transfer::derive_by_relation_transfer(
+                        self,
+                        query_pool,
+                        target_pool,
+                        &question,
+                        self.derivation_probe_budget,
+                    );
+                let Some(transferred) = transferred.filter(|a| !a.is_empty()) else {
+                    return direct;
+                };
+                tracing::debug!(
+                    probes = transfer_probes,
+                    question = %String::from_utf8_lossy(&question),
+                    answer = %String::from_utf8_lossy(&transferred),
+                    "derived an answer by relation transfer"
+                );
+                transferred
+            }
+        };
+        let mut grounding = direct.grounding.clone();
+        // Composition, not retrieval: the answer was assembled from questions
+        // the brain was taught and this one was not among them.
+        grounding.speculation_flag = true;
+        grounding.outside_grounding = false;
+        AnswerWithGrounding {
+            answer: Some(derived),
+            grounding,
+            confidence_tier: ConfidenceTier::Speculative,
+            next_steps_if_ungrounded: Vec::new(),
+        }
+    }
+
+    /// Let [`Self::integrate_autonomous`] derive, and bound what it may spend.
+    ///
+    /// Deliberately NOT `chain_max_visit`: that budget bounds a walk over the
+    /// EEM fact graph, and this bounds re-asking the fabric, which is a
+    /// different resource with a different measured cost. Read the cost off
+    /// `derive_by_substitution_profiled`, which reports the probe count per
+    /// derivation, rather than inferring it from `n(n+1)/2`: measured 27 for a
+    /// two-hop prefix question, 167 for three hops, 673 when the taught
+    /// sub-question is not a prefix.
+    ///
+    /// `0` disables the derivation, which is the default -- see
+    /// `derivation_probe_budget` for the table of what each setting costs.
+    /// Remember a cut that located a taught sub-question, most-recently-useful
+    /// first. See [`Self::derivation_cut_hints`] for why the offset is measured
+    /// from the END of the question.
+    fn note_derivation_cut(&mut self, n: usize, k: usize, tail: usize) {
+        if let Some(pos) = self.derivation_cut_hints.iter().position(|(hn, _, _)| *hn == n) {
+            let mut hit = self.derivation_cut_hints.remove(pos);
+            // Keep the SHORTEST cut seen at this length, because that is the
+            // one the scan returns, and move it to the front as the most
+            // recently useful.
+            if k < hit.1 {
+                hit = (n, k, tail);
+            }
+            self.derivation_cut_hints.insert(0, hit);
+            return;
+        }
+        self.derivation_cut_hints.insert(0, (n, k, tail));
+        self.derivation_cut_hints.truncate(DERIVATION_CUT_HINTS);
+    }
+
+    /// The cuts [`Self::derive_by_substitution`] will try first, most recently
+    /// useful first. Exposed so a test can assert the cache is a CACHE — that
+    /// it is bounded and that it learned the shape — rather than inferring it
+    /// from a probe count.
+    pub fn derivation_cut_hints(&self) -> &[(usize, usize, usize)] {
+        &self.derivation_cut_hints
+    }
+
+    /// Remember the SET of splice points that reached the ceiling for a
+    /// shape. See [`Self::derivation_splice_hints`] for why it is the set and
+    /// not the first one.
+    fn note_derivation_splice(&mut self, n: usize, k: usize, js: Vec<usize>) {
+        if js.is_empty() {
+            return;
+        }
+        if let Some(pos) = self
+            .derivation_splice_hints
+            .iter()
+            .position(|(hn, hk, _)| *hn == n && *hk == k)
+        {
+            let hit = self.derivation_splice_hints.remove(pos);
+            // The WIDER set wins. A replay that found fewer ceiling rewrites
+            // than a full scan did is a replay of a set that was already too
+            // narrow, and narrowing it again is how a cache converges on the
+            // first-wins behaviour the vote exists to replace.
+            let keep = if js.len() > hit.2.len() { (n, k, js) } else { hit };
+            self.derivation_splice_hints.insert(0, keep);
+            return;
+        }
+        self.derivation_splice_hints.insert(0, (n, k, js));
+        self.derivation_splice_hints.truncate(DERIVATION_SPLICE_HINTS);
+    }
+
+    /// The splice points to replay for a question of length `n` cut at `k`,
+    /// empty when the shape has not been seen.
+    fn derivation_splice_hint(&self, n: usize, k: usize) -> Vec<usize> {
+        self.derivation_splice_hints
+            .iter()
+            .find(|(hn, hk, _)| *hn == n && *hk == k)
+            .map(|(_, _, js)| js.clone())
+            .unwrap_or_default()
+    }
+
+    /// The splice points [`Self::derive_by_substitution`] will try first.
+    /// Exposed so a test can assert the cache is bounded and that it learned
+    /// the shape, rather than inferring either from a probe count.
+    pub fn derivation_splice_hints(&self) -> &[(usize, usize, Vec<usize>)] {
+        &self.derivation_splice_hints
+    }
+
+    pub fn set_derivation_probe_budget(&mut self, probes: usize) {
+        self.derivation_probe_budget = probes;
+    }
+
+    /// What [`Self::set_derivation_probe_budget`] was last set to.
+    pub fn derivation_probe_budget(&self) -> usize {
+        self.derivation_probe_budget
+    }
+
+    /// How many hops the last [`Self::derive_by_substitution_profiled`] walked
+    /// into an untaught rewrite. Kept for diagnostics; relation transfer is
+    /// gated by [`Self::derivation_found_taught_subquestion`] instead.
+    ///
+    /// Reset at every return of that method, including the early one, so it is
+    /// never a count left over from a previous call.
+    pub fn derivation_last_continuations(&self) -> Option<usize> {
+        self.derivation_last_continuations
+    }
+
+    /// Verdict from the latest substitution search, shared with composed
+    /// answer paths. `None` means no complete verdict was reached.
+    pub fn derivation_found_taught_subquestion(&self) -> Option<bool> {
+        self.derivation_found_taught_subquestion
+    }
+
+    /// Let [`Self::integrate_autonomous`] answer from `relation_transfer`.
+    /// The switch is enabled by default; fallback answers still require a
+    /// completed negative taught-sub-question verdict.
+    pub fn set_relation_transfer_in_answer_path(&mut self, on: bool) {
+        self.relation_transfer_in_answer_path = on;
+    }
+
+    /// Whether the relation-transfer arm may answer. `true` by default.
+    pub fn relation_transfer_in_answer_path(&self) -> bool {
+        self.relation_transfer_in_answer_path
+    }
+
+    /// The frame last observed into `pool`, if it arrived recently enough to
+    /// still be the question being answered. Reuses `recent_frames` and the
+    /// 2-tick window [`Self::observe`] already applies to QA capture.
+    fn fresh_observed_frame(&self, pool: PoolId) -> Option<Vec<u8>> {
+        let now = self.fabric.current_tick();
+        let (frame, tick) = self.recent_frames.get(&pool)?;
+        if frame.is_empty() || now.saturating_sub(*tick) > 2 {
+            return None;
+        }
+        Some(frame.clone())
+    }
+
+    pub fn integrate_autonomous_tuned(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        fabric_confidence_threshold: f32,
+        chain_max_depth: usize,
+        chain_max_visit: usize,
+        binding_match_threshold: f32,
+    ) -> AnswerWithGrounding {
+        // 0. Out-of-vocab gate (Stage 9 + Stage 11 concept tier).
+        // SINGLE source of truth for "is this prompt grounded".  Tries
+        // concept-tier matching first (sparse, high-precision) and
+        // falls back to atom-tier.  The audit-4 rule: this is the only
+        // gate site; downstream code does not re-decide.
+        let bm = self.best_binding_match_v2(query_pool);
+        let binding_score = bm.score();
+        if bm.precision < binding_match_threshold {
+            return AnswerWithGrounding {
+                answer: None,
+                grounding: GroundingReport {
+                    input_atom_coverage: 0.0,
+                    strongest_match: None,
+                    strongest_match_jaccard: 0.0,
+                    composition_used: Vec::new(),
+                    fabric_confidence: binding_score,
+                    eem_confidence: None,
+                    annealer_confidence: None,
+                    integrated_confidence: binding_score,
+                    outside_grounding: true,
+                    speculation_flag: false,
+                    peer_contributions: Vec::new(),
+                },
+                confidence_tier: ConfidenceTier::Ungrounded,
+                next_steps_if_ungrounded: vec![crate::grounding::RequestObservation {
+                    domain: format!(
+                        "no trained binding matches this prompt at tier={:?} \
+                             with sufficient precision",
+                        bm.tier
+                    )
+                    .into(),
+                    examples_needed: 1,
+                    why: format!(
+                        "best binding precision={:.2} (tier={:?}) < threshold={:.2}",
+                        bm.precision, bm.tier, binding_match_threshold
+                    )
+                    .into(),
+                    pool: query_pool,
+                }],
+            };
+        }
+
+        // 1. Try the fabric path.
+        //
+        // We already passed the step-0 binding-precision gate, so this
+        // prompt is in-vocabulary as far as Stage 9 honesty is
+        // concerned.  The inner `integrate` may still flag its own
+        // `outside_grounding=true` based on a stricter fabric-
+        // confidence threshold — we deliberately *don't* propagate
+        // that flag here, because step 0 is now the single source of
+        // truth on "is this prompt grounded".  If `integrate` returned
+        // a non-empty answer at or above `fabric_confidence_threshold`,
+        // accept it instead of letting chain_explore re-decide.
+        let fabric_ans = self.integrate(query_pool, target_pool);
+        let fabric_has_answer = fabric_ans
+            .answer
+            .as_ref()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false);
+        // An EXACT binding recall, and why this third term exists even though
+        // it is measured to be a no-op today.
+        //
+        // Backlog `[988dd17c]` reported this arm as shadowing `chain_explore`
+        // and the derivation below it. The shadowing SHAPE is real -- every arm
+        // that can compose an answer sits under this `return` -- but the
+        // condition above has two terms and the report priced only the second.
+        // Measured in `tests/fabric_arm_shadows_derivation.rs` on the
+        // 16-binding lamp/desk/material world: `integrate()` answers 0 of 16
+        // even on TRAINED questions and reports `fabric_confidence 0.0000`, so
+        // `fabric_has_answer` is false and this arm is unreachable at the
+        // node's 0.10 threshold and at the scorecard's 100.0 alike. Lowering
+        // the threshold to zero would not fire it.
+        //
+        // So this term fixes nothing today, and it is here because the arm's
+        // unreachability rests on a READING of one propagation path rather than
+        // on anything structural: the day `integrate()` starts answering, this
+        // `return` hands a propagation score back as if it were a retrieval,
+        // with the inner `outside_grounding` flag cleared, for a prompt the
+        // brain cannot bind exactly. PRIORITY ZERO prefers silence to a
+        // plausible answer, and the arms below are the ones that can be
+        // grounded.
+        //
+        // RECALL and not precision, and the arithmetic is at `4120` above:
+        // `precision = intersect / bind_query.len()`, `recall = intersect /
+        // q_atoms.len()`. A composite prompt CONTAINS its own sub-question, so
+        // that binding is explained whole and precision is 1.0 -- a precision
+        // test here would be inert, which is the defect it would be meant to
+        // fix. Measured on that same world: composite precision 1.0000, recall
+        // 0.7500; every taught question recalls 1.0000, so this cannot cost a
+        // retrieval. Both are asserted, not printed.
+        let recalled_exactly = bm.recall >= 0.999;
+        if fabric_has_answer
+            && recalled_exactly
+            && fabric_ans.grounding.fabric_confidence >= fabric_confidence_threshold
+        {
+            // Clear the inner outside_grounding flag — step 0 already
+            // owns that decision and said this query IS grounded.
+            let mut g = fabric_ans.grounding.clone();
+            g.outside_grounding = false;
+            return AnswerWithGrounding {
+                answer: fabric_ans.answer,
+                grounding: g,
+                confidence_tier: fabric_ans.confidence_tier,
+                next_steps_if_ungrounded: fabric_ans.next_steps_if_ungrounded,
+            };
+        }
+
+        // 2. Build the seed set: every firing query-pool atom + every
+        // firing query-pool concept's atomic leaves.  These are the
+        // refs the chain explorer walks from.
+        let query_handle = match self.fabric.pool(query_pool) {
+            Some(p) => p,
+            None => return fabric_ans,
+        };
+        let q = query_handle.read();
+        let mut seed: Vec<(PoolId, NeuronId)> = Vec::new();
+        for nid in q.currently_firing() {
+            seed.push((query_pool, nid));
+        }
+        drop(q);
+        if seed.is_empty() {
+            return fabric_ans;
+        }
+
+        // 3. Walk the EEM's grounded-fact graph from those seeds.
+        let chain = self
+            .eem
+            .chain_explore(&seed, chain_max_depth, chain_max_visit);
+
+        // 4. Filter reached members to the target pool and rank by
+        // chain confidence (product of fact confidences along the
+        // shortest path).
+        let mut target_candidates: Vec<((PoolId, NeuronId), f32)> = chain
+            .reached_members
+            .iter()
+            .filter(|((p, _), _)| *p == target_pool)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        if target_candidates.is_empty() {
+            // Chain found nothing in target pool → return the fabric
+            // attempt (which may have low confidence; honest signal).
+            return if fabric_has_answer
+                && recalled_exactly
+                && fabric_ans.grounding.fabric_confidence >= fabric_confidence_threshold
+            {
+                fabric_ans
+            } else {
+                let mut rejected = fabric_ans;
+                rejected.answer = None;
+                rejected
+            };
+        }
+        target_candidates
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 5. Annealer-guided ranking + Stage 11C multi-fact assembly.
+        //
+        // Ranking: combine chain confidence with the annealer's
+        // predicted activation in the target pool, just like the
+        // Stage 8 single-pick path did.
+        let prediction = self.annealer.predict_next(target_pool);
+        let pred_frame = prediction.as_ref().map(|p| &p.predicted_frame);
+
+        let mut ranked: Vec<((PoolId, NeuronId), f32, f32)> = target_candidates
+            .iter()
+            .map(|(nref, conf)| {
+                let pred = pred_frame
+                    .and_then(|f| f.get(&nref.1).copied())
+                    .unwrap_or(0.0);
+                let score = conf + 0.5 * pred;
+                (*nref, *conf, score)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Multi-fact gate.  Audit-2 hard cap: at most 4 facts assembled.
+        // Audit-10 confidence-delta gate: facts 2..N are only included
+        // if their chain confidence is at least 0.6 × the top fact's.
+        // Audit-8 single-fact preservation: when only one fact passes,
+        // the output is byte-identical to the Stage 8 single-decode
+        // path — no separator, no period, no behavior change for the
+        // toddler 32-pair regression baseline.
+        const MULTI_FACT_CAP: usize = 4;
+        const MULTI_FACT_MIN_RATIO: f32 = 0.6;
+        const MULTI_FACT_SEP: &[u8] = b". ";
+
+        let top_conf = ranked.first().map(|(_, c, _)| *c).unwrap_or(0.0);
+        let selected: Vec<((PoolId, NeuronId), f32)> = ranked
+            .iter()
+            .take(MULTI_FACT_CAP)
+            .enumerate()
+            .filter(|(i, (_, c, _))| *i == 0 || *c >= top_conf * MULTI_FACT_MIN_RATIO)
+            .map(|(_, (nref, c, _))| (*nref, *c))
+            .collect();
+
+        let (best_ref, best_conf) = match selected.first().copied() {
+            Some(x) => x,
+            None => return fabric_ans,
+        };
+
+        // Multi-fact trigger correction (audit-8 single-fact pin).
+        // The reached_members list may contain many distinct atoms
+        // even when chain explored a *single* EEM grounded fact
+        // (e.g., the single trained pair `dog → animal` exposes 5
+        // pool_b atoms — a, n, i, m, l).  Concatenating all 5 with
+        // ". " separators produces nonsense like "a. n. i. m. l".
+        //
+        // The right granularity is *facts*, not member atoms.  We
+        // only fire the multi-fact concat path when the chain
+        // actually traversed >= 2 distinct EEM facts.  Single-fact
+        // chains decode their single best target as before
+        // (byte-identical to the Stage 8 path).
+        let fire_multi_fact = chain.visited_facts.len() >= 2 && selected.len() >= 2;
+
+        // 6. Decode each selected target neuron.  Single-fact path
+        // produces a single byte sequence; multi-fact path joins with
+        // the period+space separator.
+        let target_handle = match self.fabric.pool(target_pool) {
+            Some(p) => p,
+            None => return fabric_ans,
+        };
+        let t = target_handle.read();
+
+        let decode_one = |nid: NeuronId| -> Option<Vec<u8>> {
+            match t.get(nid) {
+                Some(n) if n.is_atom() => {
+                    let pairs = [(n.label.as_str(), 1.0_f32)];
+                    Some(t.encoding_reassemble(&pairs))
+                }
+                Some(n) => Some(t.decode_concept_members(&n.members)),
+                None => None,
+            }
+        };
+
+        let answer_bytes: Option<Vec<u8>> = if !fire_multi_fact {
+            // Single-fact preservation (audit-8).  Byte-identical to
+            // the Stage 8 path: a single-atom trained pair (K->V)
+            // returns "V" exactly, no quality gate, because there's
+            // nothing to assemble.  The substrate is honest that it
+            // has only that one fact and reports it back.
+            decode_one(best_ref.1)
+        } else {
+            // Multi-fact assembly.  Decode each candidate.
+            let mut decoded_parts: Vec<Vec<u8>> = Vec::with_capacity(selected.len());
+            for (nref, _conf) in selected.iter() {
+                if let Some(bytes) = decode_one(nref.1) {
+                    if !bytes.is_empty() {
+                        decoded_parts.push(bytes);
+                    }
+                }
+            }
+            // Atom-soup defense: when the chain explorer walked a
+            // fanout of single-byte atoms (e.g. 'l', 'm', 'n', 'i'
+            // from an action pool that only ever saw brief words),
+            // joining them as "l. m. n. i" produces high-confidence
+            // gibberish.  Refuse the join entirely when EVERY
+            // decoded part is a single byte — the substrate then
+            // honestly reports outside_grounding and the caller
+            // (`/brain/ask`, the hypothesis research loop) gets a
+            // truthful "I don't know" instead of confident noise.
+            // When at least one part is multi-byte (a real concept
+            // decode like "alpha" or "beta"), assembly proceeds
+            // normally, preserving back-compat with the multi-fact
+            // regression pins.
+            let all_single_byte =
+                !decoded_parts.is_empty() && decoded_parts.iter().all(|p| p.len() == 1);
+            if all_single_byte || decoded_parts.is_empty() {
+                None
+            } else if decoded_parts.len() == 1 {
+                Some(decoded_parts.into_iter().next().unwrap())
+            } else {
+                let mut out = Vec::new();
+                for (i, part) in decoded_parts.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(MULTI_FACT_SEP);
+                    }
+                    out.extend_from_slice(part);
+                }
+                Some(out)
+            }
+        };
+
+        // 7. Assemble the grounding.  Multi-fact path also populates
+        // `composition_used` so callers can audit which target
+        // neurons contributed to the assembled answer.
+        let mut g = fabric_ans.grounding.clone();
+        g.eem_confidence = Some(best_conf);
+        let f = g.fabric_confidence.max(0.0);
+        g.integrated_confidence = ((f * best_conf).sqrt()).max(best_conf * 0.5);
+        g.strongest_match = Some(NeuronRef::new(target_pool, best_ref.1));
+        g.composition_used = if fire_multi_fact {
+            selected
+                .iter()
+                .map(|(nref, _)| NeuronRef::new(nref.0, nref.1))
+                .collect()
+        } else {
+            // Single-fact path records exactly the one neuron it
+            // decoded — the back-compat regression pin in
+            // single_fact_returns_single_decoded_answer requires
+            // composition_used.len() == 1 here.
+            vec![NeuronRef::new(target_pool, best_ref.1)]
+        };
+        g.outside_grounding = answer_bytes.as_ref().map(|b| b.is_empty()).unwrap_or(true);
+        g.speculation_flag = true; // chain-composed answer is by definition speculation
+        let tier = ConfidenceTier::from_confidence(
+            g.integrated_confidence,
+            g.outside_grounding,
+            g.speculation_flag,
+        );
+        AnswerWithGrounding {
+            answer: answer_bytes,
+            grounding: g,
+            confidence_tier: tier,
+            next_steps_if_ungrounded: Vec::new(),
+        }
+    }
+
+    /// Telemetry: count grounded facts the EEM has crystallized from
+    /// binding emergence.
+    pub fn eem_fact_count(&self) -> usize {
+        self.eem.fact_count()
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 5 — EEM-augmented integration (spec §4.D + §4.B).
+    //
+    // `integrate` returns the fabric's view with `eem_confidence:
+    // None` because no equation was consulted.  When the caller has
+    // an equation that should apply to the current context, they
+    // call `integrate_with_equation(query, target, eq, bindings)`
+    // and the EEM's confidence enters the grounding report.  The
+    // integrated_confidence becomes the geometric mean of fabric and
+    // EEM confidences — both must be grounded for the integrated
+    // answer to be strong, per spec §2.7.
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Stage 2 — Sequential generation (continuation of spec §4.E).
+    //
+    // `integrate` returns the strongest concept's decoded bytes for
+    // ONE step.  `generate` chains those steps into a sequence: emit
+    // a chunk, feed it back as input via observe + advance_tick, find
+    // the next non-emitted strongest concept in target_pool, append.
+    // Termination is on confidence floor, max step count, or when no
+    // unfired concept clears the floor.
+    //
+    // This is what turns the brain from a recognizer into a speaker.
+    // Generation is recurrent retrieval — each emitted chunk becomes
+    // the next step's context.  Open-ended novel composition is NOT
+    // here; that requires phrase-level concepts (level-3+) trained on
+    // enough natural language to have emerged the relevant
+    // compositions.  What IS here: the substrate emits whatever
+    // sequence its learned concept structure supports.
+    // ---------------------------------------------------------------
+
+    /// Generate a sequence of bytes by iterating
+    /// integrate-then-observe-back.  Each step:
+    ///   1. Propagate from the most-recent firing state (query pool at
+    ///      step 0, target pool thereafter).
+    ///   2. Consult the temporal annealer (`Annealer::predict_next`)
+    ///      for `target_pool` — its predicted-next-frame activations
+    ///      are blended additively into each candidate's score so the
+    ///      pick is influenced by "what historically follows the
+    ///      current state," not just propagation strength alone.  When
+    ///      the annealer has <2 history frames the prediction is
+    ///      absent and selection falls back to pure density (Stage 2).
+    ///   3. Score active target-pool concepts by
+    ///         `(act + annealer_weight × pred_act) / expanded_size`
+    ///      skipping concepts already emitted in this call.
+    ///   4. Decode the winner via the recursive walker and append to
+    ///      the output.
+    ///   5. Observe the decoded chunk into target_pool so its atoms
+    ///      fire and any matching concepts collapse (mini-column
+    ///      collapse runs the same way it does for sensor input);
+    ///      then `advance_tick` to capture the state into history.
+    ///
+    /// `max_steps` is a hard cap; `min_confidence` is the activation
+    /// floor (concepts below it don't qualify, ending generation).
+    /// The set of already-emitted concepts is reset per call.
+    ///
+    /// Caller is responsible for observing the prompt into `query_pool`
+    /// before calling — `generate` itself does NOT take a prompt
+    /// argument because the substrate's "prompt" IS the current pool
+    /// state, not a fresh input.  This matches how observation works
+    /// elsewhere in the API.
+    pub fn generate(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        max_steps: usize,
+        min_confidence: f32,
+    ) -> Vec<u8> {
+        self.generate_weighted(query_pool, target_pool, max_steps, min_confidence, 0.5)
+    }
+
+    /// Like [`Brain::generate`] but with an explicit `annealer_weight`
+    /// controlling how much the temporal-prediction signal influences
+    /// next-concept selection.  0.0 = pure density (Stage 2);
+    /// 0.5 = balanced (default); 1.0 = predicted-activation as
+    /// important as propagation-activation.
+    pub fn generate_weighted(
+        &mut self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        max_steps: usize,
+        min_confidence: f32,
+        annealer_weight: f32,
+    ) -> Vec<u8> {
+        let mut output: Vec<u8> = Vec::new();
+        let mut already_emitted: ahash::AHashSet<NeuronRef> = ahash::AHashSet::new();
+
+        for step in 0..max_steps {
+            let source = if step == 0 { query_pool } else { target_pool };
+            let propagated = self.fabric.propagate(source);
+
+            // Stage 3: ask the annealer what the next frame should
+            // look like given the target pool's recent history.  None
+            // when there's <2 history frames; selection then falls
+            // back to pure-density (Stage 2).
+            let prediction = self.annealer.predict_next(target_pool);
+            let pred_frame = prediction.as_ref().map(|p| &p.predicted_frame);
+
+            // Find the best non-emitted concept in target_pool.
+            let chunk: Option<(NeuronRef, Vec<u8>)> = {
+                let empty: AHashMap<NeuronId, f32> = AHashMap::new();
+                let target_act = propagated.get(&target_pool).unwrap_or(&empty);
+                let pool_arc = match self.fabric.pool(target_pool) {
+                    Some(p) => p,
+                    None => break,
+                };
+                let p = pool_arc.read();
+
+                let mut best: Option<(NeuronRef, f32)> = None;
+                let mut best_score = f32::NEG_INFINITY;
+                for (&nid, &act) in target_act.iter() {
+                    if act < min_confidence {
+                        continue;
+                    }
+                    let n = match p.get(nid) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if n.is_atom() {
+                        continue;
+                    }
+                    let r = NeuronRef::new(target_pool, nid);
+                    if already_emitted.contains(&r) {
+                        continue;
+                    }
+                    let size = p.expanded_size(&n.members).max(1);
+                    let pred_act = pred_frame
+                        .and_then(|pf| pf.get(&nid).copied())
+                        .unwrap_or(0.0);
+                    let blended = act + annealer_weight * pred_act;
+                    let score = blended / size as f32;
+                    if score > best_score {
+                        best_score = score;
+                        best = Some((r, act));
+                    }
+                }
+                best.and_then(|(r, _)| {
+                    p.get(r.neuron)
+                        .map(|n| (r, p.decode_concept_members(&n.members)))
+                })
+            };
+
+            let (r, bytes) = match chunk {
+                Some(x) => x,
+                None => break,
+            };
+            if bytes.is_empty() {
+                break;
+            }
+
+            output.extend_from_slice(&bytes);
+            already_emitted.insert(r);
+
+            // Feed the chunk back into target_pool — its atoms fire,
+            // its concepts collapse, the annealer captures the frame.
+            self.observe(target_pool, &bytes);
+            self.advance_tick();
+        }
+
+        output
+    }
+
+    /// Like [`Brain::integrate`] but additionally consults the
+    /// temporal-prediction annealer for the target pool: the
+    /// annealer's convergence energy enters `annealer_confidence` in
+    /// the grounding report, and `integrated_confidence` becomes the
+    /// geometric mean of fabric and annealer confidences.  When the
+    /// annealer has fewer than 2 history frames for the target pool,
+    /// `annealer_confidence` stays `None`.
+    pub fn integrate_with_prediction(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+    ) -> AnswerWithGrounding {
+        let mut base = self.integrate(query_pool, target_pool);
+        if let Some(pred) = self.annealer.predict_next(target_pool) {
+            base.grounding.annealer_confidence = Some(pred.confidence);
+            let f = base.grounding.fabric_confidence;
+            let a = pred.confidence;
+            base.grounding.integrated_confidence = (f * a).sqrt();
+            base.confidence_tier = ConfidenceTier::from_confidence(
+                base.grounding.integrated_confidence,
+                base.grounding.outside_grounding,
+                base.grounding.speculation_flag,
+            );
+        }
+        base
+    }
+
+    /// Like [`Brain::integrate`] but additionally consults the EEM:
+    /// the named equation is evaluated under `bindings` and its
+    /// confidence enters the grounding report.  If the equation is
+    /// not registered or any binding is missing, `eem_confidence`
+    /// stays `None` (honestly: the EEM could not contribute).
+    pub fn integrate_with_equation(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        equation_name: &str,
+        bindings: &AHashMap<&str, f64>,
+    ) -> AnswerWithGrounding {
+        let mut base = self.integrate(query_pool, target_pool);
+        let application = self.eem.apply_by_name(equation_name, bindings);
+        if let Some(app) = application {
+            base.grounding.eem_confidence = Some(app.confidence);
+            // Combine fabric and EEM confidences as a geometric mean
+            // when both are present.  Lifting one without the other
+            // would mask uncertainty.
+            let f = base.grounding.fabric_confidence;
+            let e = app.confidence;
+            base.grounding.integrated_confidence = (f * e).sqrt();
+            base.confidence_tier = ConfidenceTier::from_confidence(
+                base.grounding.integrated_confidence,
+                base.grounding.outside_grounding,
+                base.grounding.speculation_flag,
+            );
+        }
+        base
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7 — Action layer (spec §4.E).
+    //
+    // Designating an action pool makes that pool's atoms act as action
+    // neurons: when they fire (typically through cross-pool propagation
+    // from sensor input), `take_action` collects them into
+    // `ActionEvent`s with source attribution.  The caller routes the
+    // events externally and later calls `feed_outcome` with a score
+    // that reinforces or weakens the source→action terminals.
+    // ---------------------------------------------------------------
+
+    /// Designate which pool hosts action atoms.  Subsequent atom births
+    /// in that pool (via `register_action`) create action neurons.  At
+    /// most one action pool per brain; calling again replaces the
+    /// designation.
+    pub fn designate_action_pool(&mut self, pool_id: PoolId) {
+        self.action_pool_id = Some(pool_id);
+    }
+
+    pub fn action_pool_id(&self) -> Option<PoolId> {
+        self.action_pool_id
+    }
+
+    /// Create (or look up) an action atom in the designated action
+    /// pool.  Returns the neuron id of the action atom — callers store
+    /// this and pair it with their external effect (webhook URL, MQTT
+    /// topic, function call name, etc.).
+    ///
+    /// Panics if no action pool has been designated, or if the
+    /// designated pool id is unknown.  Action registration is a
+    /// configuration step; getting it wrong is a programmer error,
+    /// not a runtime condition.
+    pub fn register_action(&mut self, label: String) -> NeuronRef {
+        let pool_id = self
+            .action_pool_id
+            .expect("designate_action_pool must be called before register_action");
+        let pool = self
+            .fabric
+            .pool(pool_id)
+            .expect("action pool id is not a registered pool");
+        let mut p = pool.write();
+        if let Some(existing) = p.label_to_id(&label) {
+            return NeuronRef::new(pool_id, existing);
+        }
+        let now = self.fabric.current_tick();
+        let id = p.neuron_count() as NeuronId;
+        let neuron = Neuron::new_atom(id, label.clone(), NeuronKind::Excitatory, now);
+        p.append_neuron(neuron, label);
+        NeuronRef::new(pool_id, id)
+    }
+
+    /// Manually fire an action neuron (e.g. during supervised training
+    /// where the trainer wants to drive the action while sources are
+    /// also firing).  This deposits activation into the action pool;
+    /// `take_action` is what surfaces the corresponding event.
+    pub fn fire_action(&mut self, action: NeuronRef, strength: f32) {
+        if let Some(p) = self.fabric.pool(action.pool) {
+            let tick = self.fabric.current_tick();
+            p.write().inject_activation(action.neuron, strength, tick);
+        }
+        // Register in the moment buffer so cross-pool wiring on tick
+        // close grows source→action terminals.
+        self.fabric.mark_fired(action.pool, action.neuron);
+    }
+
+    /// Collect every action neuron that fired this tick, attribute its
+    /// sources (currently-firing neurons in other pools whose terminals
+    /// target the action neuron), and emit one `ActionEvent` per
+    /// firing.  Caller routes externally and later supplies
+    /// `feed_outcome`.
+    ///
+    /// "Fired" means: present in the action pool's `currently_firing`
+    /// set (from `fire_action`), OR reached via cross-pool propagation
+    /// from any non-action pool with activation ≥ `min_activation`.
+    /// The propagation path is what gives the substrate its agency:
+    /// sensor input → cross-pool axons → action firing → external
+    /// effect → outcome → reinforcement.
+    ///
+    /// Re-fires of the same action neuron within a single tick are
+    /// deduplicated.  Across ticks, each firing produces its own event.
+    pub fn take_action(&mut self, min_activation: f32) -> Vec<ActionEvent> {
+        let pool_id = match self.action_pool_id {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let pool = match self.fabric.pool(pool_id) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        // Step 1: collect direct firings (from `fire_action` or
+        // observed atoms in the action pool itself).
+        let mut firings: AHashMap<NeuronId, (String, f32)> = AHashMap::new();
+        {
+            let p = pool.read();
+            for nid in p.currently_firing() {
+                if let Some(n) = p.get(nid) {
+                    firings.insert(nid, (n.label.clone(), p.activation(nid)));
+                }
+            }
+        }
+
+        // Step 2: propagate from each non-action pool that has firing
+        // neurons; merge activation reaching the action pool.
+        for src_pool_id in self.fabric.pool_ids() {
+            if src_pool_id == pool_id {
+                continue;
+            }
+            let any_firing = match self.fabric.pool(src_pool_id) {
+                Some(p) => p.read().currently_firing().next().is_some(),
+                None => false,
+            };
+            if !any_firing {
+                continue;
+            }
+            let propagated = self.fabric.propagate(src_pool_id);
+            if let Some(act_map) = propagated.get(&pool_id) {
+                let p = pool.read();
+                for (&nid, &act) in act_map.iter() {
+                    if act < min_activation {
+                        continue;
+                    }
+                    if let Some(n) = p.get(nid) {
+                        let entry = firings.entry(nid).or_insert_with(|| (n.label.clone(), 0.0));
+                        entry.1 = entry.1.max(act);
+                    }
+                }
+            }
+        }
+
+        if firings.is_empty() {
+            return Vec::new();
+        }
+
+        let tick = self.fabric.current_tick();
+        let mut events = Vec::with_capacity(firings.len());
+
+        // Step 3: for each fired action neuron, find currently-firing
+        // sources elsewhere in the fabric whose terminals target it.
+        // Credit attribution by inverse-terminal lookup — there's no
+        // fabric-level routing table, so we scan owning neurons.
+        for (action_nid, (action_label, activation)) in firings {
+            let action_ref = NeuronRef::new(pool_id, action_nid);
+            if self.emitted_this_tick.contains(&action_ref) {
+                continue;
+            }
+
+            let mut sources: Vec<NeuronRef> = Vec::new();
+            for src_pool_id in self.fabric.pool_ids() {
+                if src_pool_id == pool_id {
+                    continue;
+                }
+                let src_pool = match self.fabric.pool(src_pool_id) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let sp = src_pool.read();
+                let firing_here: ahash::AHashSet<NeuronId> = sp.currently_firing().collect();
+                for nid in firing_here.iter().copied() {
+                    if let Some(n) = sp.get(nid) {
+                        if n.terminals.iter().any(|t| t.target == action_ref) {
+                            sources.push(NeuronRef::new(src_pool_id, nid));
+                        }
+                    }
+                }
+            }
+
+            let id = self.next_action_id;
+            self.next_action_id += 1;
+            let event = ActionEvent {
+                id,
+                action_neuron: action_ref,
+                action_label,
+                sources,
+                fired_at_tick: tick,
+                activation,
+            };
+            self.pending_actions.insert(id, event.clone());
+            self.emitted_this_tick.insert(action_ref);
+            events.push(event);
+        }
+
+        events
+    }
+
+    /// Apply an outcome score to a previously-emitted action.  Positive
+    /// scores reinforce source→action terminals; negative scores
+    /// weaken them.  The action_id is removed from `pending_actions`
+    /// after application — outcomes are one-shot per firing.
+    ///
+    /// Returns true if the action_id was found and feedback applied.
+    /// Returns false if the id is unknown (already-fed-back or never-
+    /// emitted).
+    pub fn feed_outcome(&mut self, action_id: ActionId, score: f32) -> bool {
+        let event = match self.pending_actions.remove(&action_id) {
+            Some(e) => e,
+            None => return false,
+        };
+        let now = self.fabric.current_tick();
+        for src in &event.sources {
+            let src_pool = match self.fabric.pool(src.pool) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut sp = src_pool.write();
+            let max_w = sp.config.max_weight;
+            let mut delta_terminals: usize = 0;
+            if let Some(n) = sp.get_mut(src.neuron) {
+                // Positive: strengthen via the same idempotent
+                // reinforce path.  Negative: directly subtract from
+                // the existing terminal's weight (clamped at 0; prune
+                // happens on the next housekeeping pass).
+                if score >= 0.0 {
+                    if n.reinforce_terminal(event.action_neuron, score, now, max_w) {
+                        delta_terminals = 1;
+                    }
+                } else {
+                    if let Some(t) = n
+                        .terminals
+                        .iter_mut()
+                        .find(|t| t.target == event.action_neuron)
+                    {
+                        t.weight = (t.weight + score).max(0.0);
+                        t.last_fired_tick = now;
+                    }
+                }
+            }
+            sp.total_terminals += delta_terminals;
+        }
+        true
+    }
+
+    /// Number of action events awaiting outcome feedback.  Surfaced
+    /// for caller telemetry — a runaway value indicates outcomes are
+    /// not being supplied for fired actions.
+    pub fn pending_action_count(&self) -> usize {
+        self.pending_actions.len()
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 8 — Distributed network (spec §5).
+    //
+    // The brain crate defines protocol + data model; transport lives
+    // outside (cluster gossip plugs in here via the drain/ingest
+    // methods).  Spec §1.7 puts the network as a property of the
+    // brain factory, not a baked-in stack.
+    // ---------------------------------------------------------------
+
+    pub fn brain_id(&self) -> &str {
+        &self.network.brain_id
+    }
+    pub fn set_brain_id(&mut self, id: impl Into<String>) {
+        self.network.brain_id = id.into();
+    }
+
+    /// Drain all pending outbound motif records.  Transport calls
+    /// this periodically (or after each `advance_tick`) and ships
+    /// the result over the cluster.  Returns the drained motifs;
+    /// the brain's outbound queue is left empty.
+    pub fn drain_motif_gossip(&mut self) -> Vec<GossipMotif> {
+        std::mem::take(&mut self.network.pending_motif_out)
+    }
+
+    /// Number of motif records currently queued for outbound gossip.
+    pub fn pending_motif_count(&self) -> usize {
+        self.network.pending_motif_out.len()
+    }
+
+    /// Ingest motif records gossiped from peer brains.  Records from
+    /// this brain's own id are dropped (self-loop guard) — motif
+    /// echoes from broadcast topologies should not show up in the
+    /// network index.  Repeat records from the same peer about the
+    /// same fingerprint update the existing entry rather than
+    /// duplicating.
+    pub fn ingest_motif_gossip(&mut self, motifs: Vec<GossipMotif>) {
+        for mut m in motifs {
+            if m.source_brain == self.network.brain_id {
+                continue;
+            }
+            m.fingerprint.sort();
+            let key = (m.source_brain.clone(), m.fingerprint.clone());
+            if let Some(slot) = self
+                .network
+                .received_motifs
+                .iter_mut()
+                .find(|(k, _)| *k == key)
+            {
+                slot.1 = m;
+            } else {
+                self.network.received_motifs.push((key, m));
+            }
+        }
+    }
+
+    pub fn received_motif_count(&self) -> usize {
+        self.network.received_motifs.len()
+    }
+
+    pub fn received_motifs_from(&self, peer: &str) -> Vec<&GossipMotif> {
+        self.network
+            .received_motifs
+            .iter()
+            .filter(|((b, _), _)| b == peer)
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Snapshot every registered equation as a `GossipEquation`
+    /// suitable for cluster broadcast.  Simple whole-state-sync is
+    /// honest and idempotent — receivers merge by confidence.
+    pub fn export_equations_for_gossip(&self) -> Vec<GossipEquation> {
+        let id = self.network.brain_id.clone();
+        self.eem
+            .iter_equations()
+            .map(|eq| {
+                let variable_names = eq
+                    .variables
+                    .iter()
+                    .filter_map(|vid| self.eem.variable(*vid).map(|v| v.name.clone()))
+                    .collect();
+                let discipline_name = eq
+                    .discipline
+                    .and_then(|did| self.eem.discipline(did).map(|d| d.name.clone()));
+                GossipEquation {
+                    source_brain: id.clone(),
+                    name: eq.name.clone(),
+                    expression: eq.expression.clone(),
+                    variable_names,
+                    discipline_name,
+                    confidence: eq.confidence,
+                    validation_successes: eq.validation_successes,
+                    validation_failures: eq.validation_failures,
+                }
+            })
+            .collect()
+    }
+
+    /// Merge peer equation deltas into the local EEM.  Conflict
+    /// resolution per spec §5.2: per-equation confidence wins.  A
+    /// peer equation strictly higher in confidence than the local
+    /// copy replaces the expression and adopts the peer's validation
+    /// counters; otherwise the local copy is kept.  Unknown
+    /// equations are added at the peer's confidence.
+    pub fn ingest_equation_gossip(&mut self, equations: Vec<GossipEquation>) {
+        for ge in equations {
+            if ge.source_brain == self.network.brain_id {
+                continue;
+            }
+            // Variables: register by name (idempotent).
+            let var_ids: Vec<_> = ge
+                .variable_names
+                .iter()
+                .map(|n| self.eem.register_variable(n.clone(), None))
+                .collect();
+            let disc_id = ge
+                .discipline_name
+                .as_ref()
+                .map(|n| self.eem.register_discipline(n.clone()));
+
+            match self.eem.equation_by_name(&ge.name) {
+                Some(eq_id) => {
+                    let local_conf = self.eem.confidence(eq_id).unwrap_or(0.0);
+                    if ge.confidence > local_conf {
+                        // Replace expression and re-seat confidence /
+                        // validation counters from the peer.
+                        self.eem
+                            .replace_equation_expression(eq_id, ge.expression.clone());
+                        if let Some(eq) = self.eem.equation_mut(eq_id) {
+                            eq.confidence = ge.confidence;
+                            eq.validation_successes = ge.validation_successes;
+                            eq.validation_failures = ge.validation_failures;
+                        }
+                    }
+                }
+                None => {
+                    let eq_id = self.eem.register_equation(
+                        ge.name.clone(),
+                        ge.expression.clone(),
+                        var_ids,
+                        disc_id,
+                    );
+                    if let Some(eq) = self.eem.equation_mut(eq_id) {
+                        eq.confidence = ge.confidence;
+                        eq.validation_successes = ge.validation_successes;
+                        eq.validation_failures = ge.validation_failures;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn peer_accuracy(&self, peer: &str) -> Option<&PeerAccuracy> {
+        self.network.peer_accuracy.get(peer)
+    }
+
+    /// Record an outcome for a peer's contribution.  Drives the
+    /// per-peer accuracy rate used by `integrate_with_peers`.
+    pub fn report_peer_outcome(&mut self, peer: impl Into<String>, success: bool) {
+        let entry = self.network.peer_accuracy.entry(peer.into()).or_default();
+        if success {
+            entry.successful_contributions = entry.successful_contributions.saturating_add(1);
+        } else {
+            entry.failed_contributions = entry.failed_contributions.saturating_add(1);
+        }
+    }
+
+    pub fn known_peers(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.network.peer_accuracy.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Like [`Brain::integrate`] but folds caller-supplied peer
+    /// contributions into the grounding report.  Each peer's
+    /// `fabric_confidence` is weighted by its [`PeerAccuracy::rate`]
+    /// (unknown peers get 0.5 — neutral) and surfaces in
+    /// `GroundingReport.peer_contributions`.  The
+    /// `integrated_confidence` becomes a weighted blend of the local
+    /// fabric confidence and the average weighted peer confidence.
+    pub fn integrate_with_peers(
+        &self,
+        query_pool: PoolId,
+        target_pool: PoolId,
+        peers: &[PeerContribution],
+    ) -> AnswerWithGrounding {
+        let mut base = self.integrate(query_pool, target_pool);
+        if peers.is_empty() {
+            return base;
+        }
+
+        let mut weighted: Vec<(BrainId, f32)> = Vec::with_capacity(peers.len());
+        let mut sum_weights = 0.0_f32;
+        let mut sum_weighted_conf = 0.0_f32;
+        for p in peers {
+            let rate = self
+                .network
+                .peer_accuracy
+                .get(&p.brain_id)
+                .map(|a| a.rate())
+                .unwrap_or(0.5);
+            let weighted_conf = (p.fabric_confidence * rate).clamp(0.0, 1.0);
+            weighted.push((p.brain_id.clone(), weighted_conf));
+            sum_weights += rate;
+            sum_weighted_conf += weighted_conf * rate;
+        }
+
+        let local_fabric = base.grounding.fabric_confidence;
+        let peer_blend = if sum_weights > 1e-9 {
+            sum_weighted_conf / sum_weights
+        } else {
+            0.0
+        };
+
+        // Blend local + peer 50/50 by weighted contribution mass.
+        // A stronger local signal still dominates; a confident-and-
+        // accurate peer chorus lifts the integrated score.
+        let blended = (local_fabric + peer_blend) / 2.0;
+        base.grounding.peer_contributions = weighted;
+        base.grounding.integrated_confidence = blended;
+        base.confidence_tier = ConfidenceTier::from_confidence(
+            base.grounding.integrated_confidence,
+            base.grounding.outside_grounding,
+            base.grounding.speculation_flag,
+        );
+        base
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10 — Brain factory (spec §3 + §11).
+    //
+    // Builds a fully-wired brain from a declarative
+    // `BrainIdentitySpec` plus a `PoolPrototypeRegistry` that knows
+    // how to instantiate encodings.  The Action pool (if any) is
+    // auto-designated; the EEM and annealer come up empty for the
+    // caller to seed.
+    // ---------------------------------------------------------------
+
+    pub fn from_identity(
+        identity: &BrainIdentitySpec,
+        registry: &PoolPrototypeRegistry,
+    ) -> Result<Self, IdentityBuildError> {
+        // Detect collisions and binding-pool-id reservations up front
+        // so the brain isn't half-built when an error surfaces.
+        let binding_pool_id: PoolId = 0;
+        let mut seen_ids = ahash::AHashSet::new();
+        for ps in &identity.pools {
+            if ps.id == binding_pool_id {
+                return Err(IdentityBuildError::BindingPoolIdCollision(ps.id));
+            }
+            if !seen_ids.insert(ps.id) {
+                return Err(IdentityBuildError::DuplicatePoolId(ps.id));
+            }
+        }
+
+        let mut binding_pool_config = PoolConfig::defaults("binding", binding_pool_id);
+        binding_pool_config.concept_emergence_threshold = u32::MAX;
+        let config = BrainConfig {
+            fabric: identity.fabric.clone(),
+            binding_emergence_threshold: identity.binding_emergence_threshold,
+            tentative_emergence_threshold: default_tentative_emergence_threshold(),
+            moment_history_window: identity.moment_history_window,
+            min_atom_score: identity.min_atom_score,
+            pressure_band_low: default_pressure_band_low(),
+            pressure_band_high: default_pressure_band_high(),
+            pressure_threshold_max: default_pressure_threshold_max(),
+            pressure_observation_grace: default_pressure_observation_grace(),
+            pressure_adjust_enabled: default_pressure_adjust_enabled(),
+            binding_pool_config,
+            eem: identity.eem.clone(),
+            annealer: identity.annealer.clone(),
+        };
+        let mut brain = Self::new(config);
+
+        for ps in &identity.pools {
+            let encoding = registry
+                .build(&ps.prototype, &ps.atom_encoding_prefix)
+                .ok_or_else(|| IdentityBuildError::UnknownPrototype(ps.prototype.clone()))?;
+            brain.create_pool(ps.to_pool_config(), encoding);
+        }
+
+        // Auto-designate the first Action pool, if any.  At most one
+        // Action pool is meaningful per spec §4.E; later Action pools
+        // in the spec are stored but not designated.
+        for ps in &identity.pools {
+            if matches!(ps.kind, PoolKind::Action) {
+                brain.designate_action_pool(ps.id);
+                break;
+            }
+        }
+
+        Ok(brain)
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 4 — Sleep cycle (spec §6.3).
+    //
+    // Identifies weak/stale concept neurons across all pools and
+    // soft-prunes them: their outgoing terminals are zeroed and all
+    // inbound terminals (within-pool AND cross-pool) are removed.
+    // Then runs an extra housekeeping pass on every pool so the
+    // zeroed terminals drop below the prune floor.
+    //
+    // Sleep is what makes "survival of fittest" actually surface
+    // strong emergence — without it, every cross-pair boundary
+    // pattern that crosses the emergence threshold sticks around and
+    // dilutes the substrate's concept space.
+    // ---------------------------------------------------------------
+
+    /// Soft-prune all concept neurons across all pools whose
+    /// `use_count` is below `min_use_count` and whose `last_fired_tick`
+    /// is more than `stale_ticks` in the past.
+    ///
+    /// Returns the total number of concepts pruned.
+    ///
+    /// This is the **single-shot** form, retained for tests and tools that
+    /// don't need to yield to other HTTP traffic.  Per [`ARCHITECTURE.md`]
+    /// §17.4, the production sleep path is the decomposed
+    /// [`Brain::sleep_pool_phase1`] / [`Brain::sleep_pool_phase2`] /
+    /// [`Brain::sleep_pool_housekeeping`] trio invoked by the
+    /// [`crate::store`]-aware HTTP handler so other endpoints can interleave.
+    /// Note this is `&self` — all the actual mutation happens through
+    /// `pool.write()` on per-pool RwLocks.
+    pub fn sleep(&self, min_use_count: u64, stale_ticks: u64) -> usize {
+        let mut total_pruned = 0usize;
+        let mut pruned_refs: ahash::AHashSet<NeuronRef> = ahash::AHashSet::new();
+        let pool_ids = self.fabric.pool_ids();
+
+        // Phase 1: per-pool prune; collect (pool, neuron) refs.
+        for pid in &pool_ids {
+            let pruned = self.sleep_pool_phase1(*pid, min_use_count, stale_ticks);
+            total_pruned += pruned.len();
+            pruned_refs.extend(pruned.into_iter());
+        }
+
+        // Phase 2: clean cross-pool inbound terminals targeting anything
+        // pruned in phase 1.
+        if !pruned_refs.is_empty() {
+            for pid in &pool_ids {
+                self.sleep_pool_phase2(*pid, &pruned_refs);
+            }
+        }
+
+        // Phase 3: extra housekeeping so any zero-weight residuals
+        // drop below the prune floor.
+        for pid in &pool_ids {
+            self.sleep_pool_housekeeping(*pid);
+        }
+
+        total_pruned
+    }
+
+    /// Phase 1 of [`ARCHITECTURE.md`] §17.4 sleep decomposition — prune one
+    /// pool's weak concepts.  Returns the cross-pool refs of pruned
+    /// neurons so callers can drive the cross-pool cleanup pass (phase 2)
+    /// later, interleaved with other HTTP work.  Brief per-pool write
+    /// lock only — other pools stay readable during this call.
+    pub fn sleep_pool_phase1(
+        &self,
+        pool_id: PoolId,
+        min_use_count: u64,
+        stale_ticks: u64,
+    ) -> ahash::AHashSet<NeuronRef> {
+        let current_tick = self.fabric.current_tick();
+        let Some(pool) = self.fabric.pool(pool_id) else {
+            return ahash::AHashSet::new();
+        };
+        let pruned_ids = pool
+            .write()
+            .prune_weak_concepts(min_use_count, stale_ticks, current_tick);
+        let mut out = ahash::AHashSet::with_capacity(pruned_ids.len());
+        for nid in pruned_ids {
+            out.insert(NeuronRef::new(pool_id, nid));
+        }
+        out
+    }
+
+    /// Phase 2 of [`ARCHITECTURE.md`] §17.4 sleep decomposition — clean
+    /// inbound cross-pool terminals targeting any of `pruned_refs` from
+    /// `pool_id`.  Brief per-pool write lock only.
+    pub fn sleep_pool_phase2(&self, pool_id: PoolId, pruned_refs: &ahash::AHashSet<NeuronRef>) {
+        if pruned_refs.is_empty() {
+            return;
+        }
+        let Some(pool) = self.fabric.pool(pool_id) else {
+            return;
+        };
+        pool.write().prune_inbound_to(pruned_refs);
+    }
+
+    /// Phase 3 of [`ARCHITECTURE.md`] §17.4 sleep decomposition — final
+    /// per-pool housekeeping (decay + sub-floor prune).  Brief per-pool
+    /// write lock only.
+    pub fn sleep_pool_housekeeping(&self, pool_id: PoolId) {
+        let now = self.fabric.current_tick();
+        let Some(pool) = self.fabric.pool(pool_id) else {
+            return;
+        };
+        pool.write().tick_housekeeping(now);
+    }
+
+    // (helper for `integrate` — Jaccard on tilde-split label tokens)
+    // Defined as a free function below.
+
+    /// Drain queued deferred-promotion candidates per pool.  Called
+    /// during sleep — crystallises every concept that crossed the
+    /// emergence threshold during observe while W1Z4RD_DEFER_PROMOTION
+    /// was set.  Brief per-pool write lock.  Returns total promotions
+    /// applied across all pools.
+    pub fn sleep_drain_promotions(&self) -> usize {
+        let now = self.fabric.current_tick();
+        let mut total = 0;
+        for pid in self.fabric.pool_ids() {
+            let Some(pool) = self.fabric.pool(pid) else {
+                continue;
+            };
+            total += pool.write().drain_pending_promotions(now);
+        }
+        total
+    }
+
+    /// Aggregated pending-promotion queue depth across all pools.
+    /// Surfaced via /sleep_pressure so the operator can see when the
+    /// brain is overdue for a sleep cycle under deferred mode.
+    pub fn pending_promotion_count(&self) -> usize {
+        self.fabric
+            .pool_ids()
+            .into_iter()
+            .filter_map(|pid| self.fabric.pool(pid))
+            .map(|p| p.read().pending_promotion_count())
+            .sum()
+    }
+
+    /// Set the domain stamp for every pool's newly-created atoms +
+    /// concepts.  Island architecture: operator calls this BEFORE
+    /// training a domain-specific corpus so the resulting neurons
+    /// cluster into that island.  0 resets to global / unassigned.
+    pub fn set_domain_for_new(&self, domain_id: u32) {
+        for pid in self.fabric.pool_ids() {
+            if let Some(p) = self.fabric.pool(pid) {
+                p.write().set_domain_for_new(domain_id);
+            }
+        }
+    }
+
+    /// Per-pool neuron count broken down by domain_id.  Returns a map
+    /// keyed by (pool_id, domain_id) → count.  Lets the operator
+    /// confirm islands grew as expected during a training run.
+    pub fn domain_histogram(&self) -> std::collections::HashMap<(PoolId, u32), usize> {
+        let mut out = std::collections::HashMap::new();
+        for pid in self.fabric.pool_ids() {
+            if let Some(p) = self.fabric.pool(pid) {
+                for (dom, cnt) in p.read().domain_histogram() {
+                    out.insert((pid, dom), cnt);
+                }
+            }
+        }
+        out
+    }
+
+    /// Integration cycle — the "X is like Y" substrate.  Finds
+    /// structurally similar concept pairs across DIFFERENT domains and
+    /// adds bridge terminals between them.
+    ///
+    /// Similarity metric: cosine on each concept's co-firing signature
+    /// (its outgoing-terminal weight vector, indexed by target
+    /// NeuronRef).  Two concepts are structurally analogous if they
+    /// project into overlapping downstream targets — co-firing
+    /// fingerprint matches, NOT label-string matches.  This is the
+    /// architecture's intended similarity primitive.
+    ///
+    /// Bridges are reinforced via normal `reinforce_terminal` with
+    /// weight = similarity × 0.1, then strengthened naturally on
+    /// subsequent cross-domain co-firing (the soft domain gate in
+    /// fabric.rs lets that happen during ordinary training).
+    ///
+    /// Returns total bridges added across all pools and domain pairs.
+    pub fn integrate_islands(&self, sample_size: usize, similarity_threshold: f32) -> usize {
+        let now = self.fabric.current_tick();
+        let mut total_bridges = 0usize;
+
+        for pid in self.fabric.pool_ids() {
+            let Some(pool) = self.fabric.pool(pid) else {
+                continue;
+            };
+
+            // Bucket concept ids by domain, building a co-firing
+            // signature for each as we go.  Skip atoms (no analogical
+            // content); skip domain 0 (unassigned).
+            type Sig = ahash::AHashMap<NeuronRef, f32>;
+            let buckets: std::collections::HashMap<u32, Vec<(NeuronId, Sig)>> = {
+                let p = pool.read();
+                let mut b: std::collections::HashMap<u32, Vec<(NeuronId, Sig)>> =
+                    std::collections::HashMap::new();
+                for n in p.iter_neurons() {
+                    if n.is_atom() || n.domain_id == 0 {
+                        continue;
+                    }
+                    // Co-firing signature = outgoing terminal weights
+                    // by target.  Effective weight folds in
+                    // consolidation, so well-trained edges dominate
+                    // the analogy metric (intended — matures with
+                    // training).
+                    let mut sig: Sig = ahash::AHashMap::with_capacity(n.terminals.len());
+                    for t in &n.terminals {
+                        sig.insert(t.target, t.effective_weight());
+                    }
+                    b.entry(n.domain_id).or_default().push((n.id, sig));
+                }
+                b
+            };
+
+            let domains: Vec<u32> = buckets.keys().copied().collect();
+            for i in 0..domains.len() {
+                for j in (i + 1)..domains.len() {
+                    let dom_x = domains[i];
+                    let dom_y = domains[j];
+
+                    let xs: &[(NeuronId, Sig)] = {
+                        let slice = &buckets[&dom_x];
+                        &slice[..slice.len().min(sample_size)]
+                    };
+                    let ys: &[(NeuronId, Sig)] = {
+                        let slice = &buckets[&dom_y];
+                        &slice[..slice.len().min(sample_size)]
+                    };
+
+                    let mut pairs: Vec<(NeuronId, NeuronId, f32)> = Vec::new();
+                    for (x, sx) in xs {
+                        for (y, sy) in ys {
+                            let sim = cofiring_cosine(sx, sy);
+                            if sim >= similarity_threshold {
+                                pairs.push((*x, *y, sim));
+                            }
+                        }
+                    }
+
+                    if pairs.is_empty() {
+                        continue;
+                    }
+
+                    let mut pw = pool.write();
+                    let max_w = pw.config.max_weight;
+                    let mut added = 0usize;
+                    for (x, y, sim) in &pairs {
+                        let w = sim * 0.1;
+                        if let Some(nx) = pw.get_mut(*x) {
+                            if nx.reinforce_terminal(NeuronRef::new(pid, *y), w, now, max_w) {
+                                added += 1;
+                            }
+                        }
+                        if let Some(ny) = pw.get_mut(*y) {
+                            if ny.reinforce_terminal(NeuronRef::new(pid, *x), w, now, max_w) {
+                                added += 1;
+                            }
+                        }
+                    }
+                    pw.total_terminals += added;
+                    total_bridges += added;
+                }
+            }
+        }
+
+        total_bridges
+    }
+
+    /// Score a moment fingerprint by the mean salience of its participating
+    /// neurons.  Stage 17.7 uses this to weight replay sampling toward
+    /// moments whose neurons the brain has tagged as important.  Cheap to
+    /// compute: O(participants), no fabric-wide scan.
+    ///
+    /// Returns 0.0 for empty fingerprints (no participants).
+    pub fn moment_salience_score(&self, fp: &MomentFingerprint) -> f32 {
+        let mut sum = 0.0f32;
+        let mut n = 0u32;
+        if !fp.ordered_per_pool.is_empty() {
+            for (pid, ids) in &fp.ordered_per_pool {
+                if let Some(pool) = self.fabric.pool(*pid) {
+                    let p = pool.read();
+                    for nid in ids {
+                        if let Some(neuron) = p.get(*nid) {
+                            sum += neuron.salience_ema;
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            for &(pid, nid) in &fp.pairs() {
+                if let Some(pool) = self.fabric.pool(pid) {
+                    let p = pool.read();
+                    if let Some(neuron) = p.get(nid) {
+                        sum += neuron.salience_ema;
+                        n += 1;
+                    }
+                }
+            }
+        }
+        if n == 0 { 0.0 } else { sum / (n as f32) }
+    }
+
+    /// Stage 17.7 full — free-energy weighted REPLAY per
+    /// [`ARCHITECTURE.md`] §17.7.  Samples `count` moments from
+    /// `moment_history` via softmax (Boltzmann) over their salience
+    /// scores at temperature `beta`, then re-fires the sampled set.
+    ///
+    /// Mathematical form: `P(replay m_i) ∝ exp(beta * salience(m_i))`.
+    /// - `beta = 0`     → uniform sampling (every moment equally likely)
+    /// - `beta → ∞`     → deterministic top-K (the prior partial form)
+    /// - `beta ≈ 1–5`   → soft preference; high-salience moments favoured
+    ///   but exploration still happens
+    ///
+    /// This is the canonical free-energy minimisation form (Friston
+    /// 2010 active inference, Hinton et al. 1995 wake-sleep) translated
+    /// to the moment-buffer scale: low-energy / high-utility moments
+    /// (here proxied by salience EMA) are sampled preferentially, but
+    /// the temperature parameter lets the brain spend some replay
+    /// budget on exploration of less-tagged moments.
+    ///
+    /// Sampling is **without replacement** — each moment is chosen at
+    /// most once per pass.  Reproducible: same `seed` + same brain
+    /// state produces the same sampled set.
+    pub fn replay_free_energy_weighted(
+        &mut self,
+        count: usize,
+        strength: f32,
+        beta: f32,
+        seed: u64,
+    ) -> usize {
+        if count == 0 || strength <= 0.0 || self.moment_history.is_empty() {
+            return 0;
+        }
+        // 1. Score every moment.
+        let scored: Vec<(f32, FpKey)> = self
+            .moment_history
+            .iter()
+            .map(|fp| (self.moment_salience_score(fp), fp.clone()))
+            .collect();
+        // 2. Numerically-stable softmax: subtract max before exp.
+        let max_score = scored
+            .iter()
+            .map(|(s, _)| *s)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let safe_max = if max_score.is_finite() {
+            max_score
+        } else {
+            0.0
+        };
+        let mut weights: Vec<f32> = scored
+            .iter()
+            .map(|(s, _)| ((s - safe_max) * beta).exp().max(1e-30))
+            .collect();
+        let mut remaining_total: f32 = weights.iter().sum();
+
+        // 3. Sample without replacement via the cumulative-distribution
+        //    inverse method.  Local xorshift64 — deterministic given seed.
+        let mut rng_state = if seed == 0 {
+            0xDEADBEEF_CAFEBABE_u64
+        } else {
+            seed
+        };
+        let next_f32_unit = |state: &mut u64| -> f32 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            let mixed = x.wrapping_mul(0x2545F4914F6CDD1D);
+            ((mixed >> 40) as f32) / ((1u32 << 24) as f32)
+        };
+        let n_target = count.min(scored.len());
+        let mut chosen: Vec<FpKey> = Vec::with_capacity(n_target);
+        for _ in 0..n_target {
+            if remaining_total <= 0.0 {
+                break;
+            }
+            let u = next_f32_unit(&mut rng_state) * remaining_total;
+            let mut acc = 0.0f32;
+            let mut picked = 0usize;
+            for (i, w) in weights.iter().enumerate() {
+                acc += *w;
+                if acc >= u {
+                    picked = i;
+                    break;
+                }
+            }
+            chosen.push(scored[picked].1.clone());
+            remaining_total -= weights[picked];
+            weights[picked] = 0.0;
+        }
+
+        // 4. Re-fire each chosen moment.  Same injection + tick pattern
+        //    as the uniform / top-K replay paths above.
+        let mut replayed = 0usize;
+        for fp in &chosen {
+            let now = self.fabric.current_tick();
+            if !fp.ordered_per_pool.is_empty() {
+                for (pid, ns) in &fp.ordered_per_pool {
+                    if let Some(pool) = self.fabric.pool(*pid) {
+                        let mut pp = pool.write();
+                        for &nid in ns {
+                            pp.inject_activation(nid, strength, now);
+                        }
+                    }
+                }
+            } else {
+                for &(pid, nid) in &fp.pairs() {
+                    if let Some(pool) = self.fabric.pool(pid) {
+                        pool.write().inject_activation(nid, strength, now);
+                    }
+                }
+            }
+            self.fabric.advance_tick();
+            replayed += 1;
+        }
+        replayed
+    }
+
+    /// Stage 17.7 partial — salience-weighted REPLAY per
+    /// [`ARCHITECTURE.md`] §17.7.  Samples the top-`count` moments from
+    /// `moment_history` by their salience score, then re-fires them
+    /// (oldest-of-the-top-K first, to preserve any sequential structure).
+    /// Same activation injection + tick path as the uniform replay below
+    /// — the only difference is *which* moments are chosen.
+    ///
+    /// Closes the loop with Stage 17.5: high-salience neurons get
+    /// preferential replay, which strengthens their terminals (and bumps
+    /// their salience through confirmed learning outcomes).  Frémaux & Gerstner 2016 three-
+    /// factor plasticity at the moment-buffer scale.
+    ///
+    /// True free-energy-weighted replay using the annealer (boltzmann
+    /// sampling by `exp(-beta * free_energy_delta)`) is the full Stage
+    /// 17.7 form — ships in a follow-up once the annealer's energy
+    /// surface is exposed at the moment-fingerprint granularity.
+    pub fn replay_salience_weighted(&mut self, count: usize, strength: f32) -> usize {
+        if count == 0 || strength <= 0.0 || self.moment_history.is_empty() {
+            return 0;
+        }
+        // Score every moment in history.  Avoid scoring more than we need
+        // to consider — sort by score, take top-K.  At typical
+        // moment_history_window sizes (256-1024) this is fast.
+        let mut scored: Vec<(f32, FpKey)> = self
+            .moment_history
+            .iter()
+            .map(|fp| (self.moment_salience_score(fp), fp.clone()))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(count.min(scored.len()));
+        // Re-order by temporal order (the order in moment_history is
+        // already temporal; sort by their position there).  We don't
+        // have positions captured, but since we cloned from history in
+        // its original order before sorting, just re-collect from history
+        // selecting those whose fingerprints match.  Cheap because count
+        // is small.  Simpler: just replay in score-descending order, which
+        // gives an emphasis on most-salient-first.
+        let to_replay: Vec<FpKey> = scored.into_iter().map(|(_, fp)| fp).collect();
+
+        let mut replayed = 0usize;
+        for fp in &to_replay {
+            let now = self.fabric.current_tick();
+            if !fp.ordered_per_pool.is_empty() {
+                for (pid, ns) in &fp.ordered_per_pool {
+                    if let Some(pool) = self.fabric.pool(*pid) {
+                        let mut pp = pool.write();
+                        for &nid in ns {
+                            pp.inject_activation(nid, strength, now);
+                        }
+                    }
+                }
+            } else {
+                for &(pid, nid) in &fp.pairs() {
+                    if let Some(pool) = self.fabric.pool(pid) {
+                        pool.write().inject_activation(nid, strength, now);
+                    }
+                }
+            }
+            self.fabric.advance_tick();
+            replayed += 1;
+        }
+        replayed
+    }
+
+    /// P4 sleep-cycle REPLAY (Wilson & McNaughton 1994; McClelland,
+    /// McNaughton, O'Reilly 1995 — Complementary Learning Systems).
+    /// Re-fires the last `count` moment fingerprints in their original
+    /// firing order at reduced activation `strength`, then ticks the
+    /// fabric so cross-pool terminals reinforce the same patterns.
+    ///
+    /// Biological purpose: during sleep / quiet wakefulness, the
+    /// hippocampus replays recent activity in compressed form, driving
+    /// repeated reactivation of cortical patterns.  This consolidates
+    /// recent episodic memories into long-term cortical statistical
+    /// representations and is the mechanism by which CLS resolves the
+    /// stability/plasticity dilemma.
+    ///
+    /// Returns the number of fingerprints replayed.  Intended to be
+    /// called AFTER `sleep()` prunes weak concepts so replay only
+    /// strengthens patterns that survived pruning.
+    pub fn replay_recent_moments(&mut self, count: usize, strength: f32) -> usize {
+        if count == 0 || strength <= 0.0 {
+            return 0;
+        }
+        // Snapshot the last `count` fingerprints.  Replay in original
+        // temporal order (oldest first) so any sequential structure
+        // between them is preserved.
+        let recent: Vec<FpKey> = self
+            .moment_history
+            .iter()
+            .rev()
+            .take(count)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let mut replayed = 0usize;
+        for fp in &recent {
+            let now = self.fabric.current_tick();
+            // Re-inject each member's activation in its source pool.
+            // Walks ordered_per_pool (preserves firing order) when
+            // available, else falls back to the sorted `pairs`.
+            if !fp.ordered_per_pool.is_empty() {
+                for (pid, ns) in &fp.ordered_per_pool {
+                    if let Some(pool) = self.fabric.pool(*pid) {
+                        let mut pp = pool.write();
+                        for &nid in ns {
+                            pp.inject_activation(nid, strength, now);
+                        }
+                    }
+                }
+            } else {
+                for &(pid, nid) in &fp.pairs() {
+                    if let Some(pool) = self.fabric.pool(pid) {
+                        pool.write().inject_activation(nid, strength, now);
+                    }
+                }
+            }
+            // Advance: drives cross-pool terminal reinforcement,
+            // fingerprint re-registration (which may strengthen
+            // consolidated bindings), and the standard decay/
+            // sparsity pipeline.  This is what turns replay into
+            // actual synaptic change.
+            self.fabric.advance_tick();
+            replayed += 1;
+        }
+        replayed
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 9 — Checkpoint / restore (spec §6 + §11).
+    //
+    // Persists the entire learned state of the brain to a single
+    // bincode-encoded file.  Restore rebuilds it verbatim; the only
+    // thing the caller re-supplies is the pool encodings (which are
+    // stateless trait objects).
+    // ---------------------------------------------------------------
+
+    /// Capture this brain's full persistent state into a snapshot
+    /// struct.  Use [`crate::persistence::save_snapshot`] to write it
+    /// to disk, or hold it in memory for tests.
+    pub fn snapshot(&self) -> crate::persistence::BrainSnapshot {
+        let moment_history: std::collections::VecDeque<
+            crate::persistence::SerializableFingerprint,
+        > = self
+            .moment_history
+            .iter()
+            .map(|f| crate::persistence::SerializableFingerprint {
+                pairs: f.pairs(),
+            })
+            .collect();
+        let binding_recurrences: Vec<(crate::persistence::SerializableFingerprint, u32)> = self
+            .binding_recurrences
+            .iter()
+            .map(|(f, &c)| {
+                (
+                    crate::persistence::SerializableFingerprint {
+                        pairs: f.pairs(),
+                    },
+                    c,
+                )
+            })
+            .collect();
+        let promoted_fingerprints: Vec<(crate::persistence::SerializableFingerprint, NeuronId)> =
+            self.promoted_fingerprints
+                .iter()
+                .map(|(f, &n)| {
+                    (
+                        crate::persistence::SerializableFingerprint {
+                            pairs: f.pairs(),
+                        },
+                        n,
+                    )
+                })
+                .collect();
+        let tentative_promoted: Vec<(crate::persistence::SerializableFingerprint, NeuronId)> = self
+            .tentative_promoted
+            .iter()
+            .map(|(f, &n)| {
+                (
+                    crate::persistence::SerializableFingerprint {
+                        pairs: f.pairs(),
+                    },
+                    n,
+                )
+            })
+            .collect();
+        let lifetime_recurrences: Vec<(crate::persistence::SerializableFingerprint, u32)> = self
+            .lifetime_recurrences
+            .iter()
+            .map(|(f, &c)| {
+                (
+                    crate::persistence::SerializableFingerprint {
+                        pairs: f.pairs(),
+                    },
+                    c,
+                )
+            })
+            .collect();
+        let pending_actions: Vec<(ActionId, ActionEvent)> = self
+            .pending_actions
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        crate::persistence::BrainSnapshot {
+            format_version: crate::persistence::CURRENT_SNAPSHOT_VERSION,
+            binding_pool_id: self.binding_pool_id,
+            binding_emergence_threshold: self.config.binding_emergence_threshold,
+            moment_history_window: self.config.moment_history_window,
+            fabric: self.fabric.snapshot(),
+            eem: self.eem.snapshot(),
+            annealer: self.annealer.snapshot(),
+            moment_history,
+            binding_recurrences,
+            promoted_fingerprints,
+            tentative_promoted,
+            lifetime_recurrences,
+            tentative_emergence_threshold: self.config.tentative_emergence_threshold,
+            current_threshold: self.current_threshold,
+            total_observations: self.total_observations,
+            action_pool_id: self.action_pool_id,
+            pending_actions,
+            next_action_id: self.next_action_id,
+        }
+    }
+
+    /// Write this brain's state to `path`.  Convenience wrapper over
+    /// `snapshot()` + `persistence::save_snapshot()`.
+    ///
+    /// Per [`ARCHITECTURE.md`] §17.9, when a WAL store is attached this
+    /// also flushes the WAL and emits a `SnapshotMarker` so crash recovery
+    /// can fast-forward past replayed events that the bincode snapshot
+    /// already covers.  The bincode path is interim until the content-
+    /// addressed terminal store ships in full (Stage 17.4+).
+    pub fn checkpoint<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        // 1. Stream a borrowed view of the live graph.  Calling snapshot()
+        //    here used to clone every neuron and terminal before the first
+        //    byte reached disk; a 4.5 GB brain consequently needed another
+        //    ~6 GB of private memory and paged for minutes.  Field order and
+        //    shapes intentionally mirror BrainSnapshot exactly, so existing
+        //    restore code reads this file without a format migration.
+        #[derive(serde::Serialize)]
+        struct BrainSnapshotRef<'a> {
+            format_version: u32,
+            binding_pool_id: PoolId,
+            binding_emergence_threshold: u32,
+            tentative_emergence_threshold: u32,
+            moment_history_window: usize,
+            fabric: crate::fabric::FabricSnapshotRef<'a>,
+            eem: crate::persistence::EemSnapshot,
+            annealer: crate::persistence::AnnealerSnapshot,
+            moment_history: VecDeque<crate::persistence::SerializableFingerprint>,
+            binding_recurrences: Vec<(crate::persistence::SerializableFingerprint, u32)>,
+            promoted_fingerprints: Vec<(crate::persistence::SerializableFingerprint, NeuronId)>,
+            tentative_promoted: Vec<(crate::persistence::SerializableFingerprint, NeuronId)>,
+            lifetime_recurrences: Vec<(crate::persistence::SerializableFingerprint, u32)>,
+            current_threshold: u32,
+            total_observations: u64,
+            action_pool_id: Option<PoolId>,
+            pending_actions: Vec<(ActionId, ActionEvent)>,
+            next_action_id: ActionId,
+        }
+
+        let fingerprint = |f: &MomentFingerprint| crate::persistence::SerializableFingerprint {
+            pairs: f.pairs(),
+        };
+        let borrowed = BrainSnapshotRef {
+            format_version: crate::persistence::CURRENT_SNAPSHOT_VERSION,
+            binding_pool_id: self.binding_pool_id,
+            binding_emergence_threshold: self.config.binding_emergence_threshold,
+            tentative_emergence_threshold: self.config.tentative_emergence_threshold,
+            moment_history_window: self.config.moment_history_window,
+            fabric: crate::fabric::FabricSnapshotRef(&self.fabric),
+            eem: self.eem.snapshot(),
+            annealer: self.annealer.snapshot(),
+            moment_history: self.moment_history.iter().map(|f| fingerprint(f)).collect(),
+            binding_recurrences: self
+                .binding_recurrences
+                .iter()
+                .map(|(f, &count)| (fingerprint(f), count))
+                .collect(),
+            promoted_fingerprints: self
+                .promoted_fingerprints
+                .iter()
+                .map(|(f, &id)| (fingerprint(f), id))
+                .collect(),
+            tentative_promoted: self
+                .tentative_promoted
+                .iter()
+                .map(|(f, &id)| (fingerprint(f), id))
+                .collect(),
+            lifetime_recurrences: self
+                .lifetime_recurrences
+                .iter()
+                .map(|(f, &count)| (fingerprint(f), count))
+                .collect(),
+            current_threshold: self.current_threshold,
+            total_observations: self.total_observations,
+            action_pool_id: self.action_pool_id,
+            pending_actions: self
+                .pending_actions
+                .iter()
+                .map(|(&id, event)| (id, event.clone()))
+                .collect(),
+            next_action_id: self.next_action_id,
+        };
+        crate::persistence::save_serializable(&borrowed, path)?;
+
+        // 2. Flush the WAL and emit a snapshot marker.  When a NoopStore
+        //    is attached (the default, no W1Z4RDV1510N_DATA_DIR set) both
+        //    calls are inert.
+        let store = self.fabric.store_clone();
+        if let Err(e) = store.flush() {
+            tracing::warn!("WAL flush failed during checkpoint: {}", e);
+        }
+        let wall_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let marker = crate::store::WalEvent::SnapshotMarker {
+            tick: self.fabric.current_tick(),
+            wall_time_ms,
+        };
+        if let Err(e) = store.append(&marker) {
+            tracing::warn!("WAL marker append failed during checkpoint: {}", e);
+        }
+        if let Err(e) = store.flush() {
+            tracing::warn!("WAL flush after marker failed: {}", e);
+        }
+        if let Err(e) = store.compact_after_checkpoint() {
+            tracing::warn!("WAL compaction after checkpoint failed: {}", e);
+        }
+        Ok(())
+    }
+
+    /// Attach a persistence backend per [`ARCHITECTURE.md`] §17.9.
+    /// Fans out through the fabric to every pool.  Idempotent — safe to
+    /// call multiple times with the same store.
+    pub fn set_store(&mut self, store: std::sync::Arc<dyn crate::store::Store>) {
+        self.fabric.set_store(store);
+    }
+
+    /// Clone the persistence handle.  Exposes the `Store` to brain_server
+    /// for the `/flush` endpoint and any tooling that needs to inspect
+    /// the WAL size / force a barrier without going through `checkpoint`.
+    pub fn store_clone(&self) -> std::sync::Arc<dyn crate::store::Store> {
+        self.fabric.store_clone()
+    }
+
+    /// Stage 18.12 step 7 — scan all pools for currently-firing neurons
+    /// whose outgoing terminals point to neurons whose home is a remote
+    /// cluster peer.  Returns a per-peer batch of deposits ready to be
+    /// shipped via `POST /shard/deposit`.
+    ///
+    /// Per [`ARCHITECTURE.md`] §18.7 — per-tick all-to-all cross-shard
+    /// activation deposit batching.  Each entry is
+    /// `(target_pool_id, target_neuron_id, deposit_strength)` where
+    /// strength = `terminal.effective_weight() * source_activation`.
+    ///
+    /// Solo mode: returns empty (no remote peers, nothing to ship).
+    /// Cluster mode: returns deposits grouped by destination NodeId.
+    /// Caller is responsible for actually sending them (the brain crate
+    /// doesn't have an HTTP client; brain_server owns transport).
+    pub fn scan_cross_shard_deposits(
+        &self,
+        local_node: crate::store::NodeId,
+    ) -> std::collections::HashMap<crate::store::NodeId, Vec<(PoolId, NeuronId, f32)>> {
+        use std::collections::HashMap as StdHashMap;
+        let mut out: StdHashMap<crate::store::NodeId, Vec<(PoolId, NeuronId, f32)>> =
+            StdHashMap::new();
+
+        for pid in self.fabric.pool_ids() {
+            let Some(pool_arc) = self.fabric.pool(pid) else {
+                continue;
+            };
+            let pool = pool_arc.read();
+            // Need access to tiered_store; not exposed directly, so we
+            // peek via has_tiered_store + a helper.  Until that's wired,
+            // we walk each pool's neurons individually.
+            if !pool.has_tiered_store() {
+                continue;
+            }
+
+            // For each firing neuron, walk its terminals.
+            for nid in pool.currently_firing() {
+                let Some(neuron) = pool.get(nid) else {
+                    continue;
+                };
+                if neuron.terminals.is_empty() {
+                    continue;
+                }
+                let src_activation = pool.activation(nid);
+                if src_activation <= 0.0 {
+                    continue;
+                }
+
+                for term in &neuron.terminals {
+                    // Get the home of target.neuron.  We need the
+                    // TARGET pool's tiered_store for placement.
+                    let target_pool_arc = self.fabric.pool(term.target.pool);
+                    let target_home = match target_pool_arc {
+                        Some(p) => {
+                            let tp = p.read();
+                            // home_for through whichever store the
+                            // target pool has.  Solo pools return local
+                            // (so no deposit queued — correct).
+                            tp.tiered_home_for(term.target.neuron).unwrap_or(local_node)
+                        }
+                        None => local_node,
+                    };
+                    if target_home == local_node {
+                        continue;
+                    }
+                    let deposit = term.effective_weight() * src_activation;
+                    if deposit <= 0.0 {
+                        continue;
+                    }
+                    out.entry(target_home).or_insert_with(Vec::new).push((
+                        term.target.pool,
+                        term.target.neuron,
+                        deposit,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Stage 17.6 — map of every pool's Merkle root, keyed by pool id.
+    /// First half of the cluster anti-entropy protocol per
+    /// [`ARCHITECTURE.md`] §17.6: peers compare these maps to identify
+    /// pools whose state has diverged.  The local-only Merkle work
+    /// (`Pool::merkle_root`) is from `8c31d1f`; this method just collects
+    /// roots across the brain's pools at the brain's current tick.
+    pub fn cluster_pool_roots(&self) -> std::collections::HashMap<PoolId, crate::store::PoolRoot> {
+        let tick = self.fabric.current_tick();
+        let mut out = std::collections::HashMap::new();
+        for pid in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pid) {
+                let root = pool.read().merkle_root(tick);
+                out.insert(pid, root);
+            }
+        }
+        out
+    }
+
+    /// Stage 17.6 — merge a batch of neurons received from a peer into
+    /// `pool_id`.  Per [`ARCHITECTURE.md`] §17.6 cluster anti-entropy:
+    /// when the local Merkle root for `pool_id` disagrees with a peer's,
+    /// the peer ships its neurons here and we apply the ones we don't
+    /// have yet (idempotent on overlapping ids).
+    ///
+    /// Conservative semantics: only inserts NEW neurons (id >= local
+    /// count), never overwrites existing ones.  When inserting, the
+    /// **whole peer neuron** is taken — including its terminals,
+    /// salience, use_count, and last_fired_tick.  That's the §17.6
+    /// "deeper" form: terminal weights propagate across the cluster,
+    /// not just topology.
+    ///
+    /// Returns the count of newly-inserted neurons.
+    pub fn cluster_merge_pool(&self, pool_id: PoolId, incoming: Vec<crate::Neuron>) -> usize {
+        let Some(pool_arc) = self.fabric.pool(pool_id) else {
+            return 0;
+        };
+        let mut pool = pool_arc.write();
+        let mut inserted = 0usize;
+        for n in incoming {
+            // Sequential-id contract: only accept neurons whose id is
+            // exactly our next slot.  Prevents id-space conflicts; the
+            // peer was presumably trained on the same input order, so
+            // ids line up naturally.  Future: a translation table for
+            // peers with divergent id-space.
+            let next = pool.neuron_count() as crate::NeuronId;
+            if n.id != next {
+                continue;
+            }
+            if pool.replay_full_neuron(n) {
+                inserted += 1;
+            }
+        }
+        inserted
+    }
+
+    /// Stage 17.6 — return a snapshot of a single pool's neurons for
+    /// cluster sync.  Per [`ARCHITECTURE.md`] §17.6, this is the
+    /// "give me your authoritative state for this pool" RPC payload —
+    /// a peer fetches this when its Merkle root for `pool_id` disagrees.
+    /// Returns the pool's `Vec<Neuron>` cloned at the call moment under
+    /// a brief read lock.  For very large pools, a paginated variant is
+    /// the follow-up; this first cut is bounded by pool size in RAM.
+    pub fn cluster_pool_neurons(&self, pool_id: PoolId) -> Option<Vec<crate::Neuron>> {
+        let pool_arc = self.fabric.pool(pool_id)?;
+        let pool = pool_arc.read();
+        Some(pool.iter_neurons().cloned().collect())
+    }
+
+    /// Stage 17.9 — replay a slice of WAL events into this brain to
+    /// bring it forward from a snapshot-restored state to its true last-
+    /// known state.  Typically the slice comes from
+    /// `crate::store::load_events_after_marker`.
+    ///
+    /// Applies each event:
+    /// - `PoolRegistered`: skipped (pools already registered from
+    ///   brain.bin or from explicit setup).
+    /// - `AtomCreated` / `ConceptEmerged`: insert into the pool at the
+    ///   recorded id slot.  Idempotent — if the slot is already filled
+    ///   (snapshot already restored), the call returns false and we
+    ///   advance.
+    /// - `TerminalReinforced` / `NeuronTerminalsPruned`: deferred —
+    ///   weight-level updates aren't currently logged at hot-path rate.
+    ///   Brain re-learns weights on the next training pass.
+    /// - `NeuronEvicted`: marks the neuron as evicted (cold offset
+    ///   comes from the PoolSnapshot per Stage 17.4 step 5).
+    /// - `TickAdvanced`: advances the fabric's tick counter.
+    /// - `SnapshotMarker`: skipped (just a checkpoint barrier).
+    ///
+    /// Returns a `RecoveryStats` describing how many of each variant
+    /// were applied.
+    pub fn apply_wal_events(
+        &mut self,
+        events: &[crate::store::WalEvent],
+    ) -> crate::store::RecoveryStats {
+        use crate::store::WalEvent as E;
+        let mut stats = crate::store::RecoveryStats::default();
+        // Snapshot restore has already built indexes for every binding it
+        // contains.  Remember only binding concepts genuinely appended by
+        // this recovery tail; rebuilding the complete index here made a
+        // large startup perform the same multi-minute graph walk twice.
+        let mut recovered_bindings: Vec<(NeuronId, Vec<NeuronRef>)> = Vec::new();
+        for ev in events {
+            stats.observe(ev);
+            match ev {
+                E::PoolRegistered { .. } => { /* skip: already registered */ }
+                E::AtomCreated {
+                    pool_id,
+                    id,
+                    label,
+                    kind,
+                    born_tick,
+                } => {
+                    if let Some(pool) = self.fabric.pool(*pool_id) {
+                        pool.write()
+                            .replay_atom_create(*id, label.clone(), *kind, *born_tick);
+                    }
+                }
+                E::ConceptEmerged {
+                    pool_id,
+                    id,
+                    label,
+                    kind,
+                    members,
+                    born_tick,
+                } => {
+                    if let Some(pool) = self.fabric.pool(*pool_id) {
+                        let inserted = pool.write().replay_concept_create(
+                            *id,
+                            label.clone(),
+                            *kind,
+                            members.clone(),
+                            *born_tick,
+                        );
+                        if inserted && *pool_id == self.binding_pool_id {
+                            recovered_bindings.push((*id, members.clone()));
+                        }
+                    }
+                }
+                E::NeuronEvicted { pool_id, neuron_id } => {
+                    if let Some(pool) = self.fabric.pool(*pool_id) {
+                        pool.write().replay_neuron_evicted(*neuron_id);
+                    }
+                }
+                E::TickAdvanced { new_tick } => {
+                    self.fabric.set_tick(*new_tick);
+                }
+                E::TerminalReinforced(_) | E::NeuronTerminalsPruned { .. } => {
+                    // Weight-level updates aren't logged at hot path rate
+                    // yet; weights re-learned on next training pass.
+                }
+                E::SnapshotMarker { .. } => { /* barrier only */ }
+            }
+        }
+        // Bindings appended by the recovery tail must become visible to
+        // exact/fuzzy retrieval, but snapshot-resident bindings are already
+        // indexed.  Incremental insertion preserves identical semantics with
+        // work proportional to the tail rather than the whole brain.
+        for (id, members) in recovered_bindings {
+            self.index_binding_members(id, &members);
+        }
+        stats
+    }
+
+    /// Stage 17.4 full — attach cold tiers to every pool under
+    /// `data_dir/cold/pool_{id}.cold`.  After this call, `run_eviction_pass`
+    /// can move low-salience concepts to disk.  Binding pool is included
+    /// so the API is uniform, but the policy in `run_eviction_pass` will
+    /// skip the binding pool by default.
+    ///
+    /// Returns the number of pools that successfully attached a cold
+    /// tier.  Errors per-pool are logged but don't fail the whole call.
+    pub fn attach_cold_tiers<P: AsRef<std::path::Path>>(&mut self, data_dir: P) -> usize {
+        let dir = data_dir.as_ref().join("cold");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("attach_cold_tiers: mkdir failed: {}", e);
+            return 0;
+        }
+        let pool_ids = self.fabric.pool_ids();
+        let mut attached = 0;
+        for pid in pool_ids {
+            let path = dir.join(format!("pool_{}.cold", pid));
+            match crate::store::ColdTier::open(&path) {
+                Ok(tier) => {
+                    let tier_arc = std::sync::Arc::new(tier);
+                    if let Some(pool) = self.fabric.pool(pid) {
+                        pool.write().set_cold_tier(tier_arc);
+                        attached += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("cold tier open failed for pool {}: {}", pid, e);
+                }
+            }
+        }
+        attached
+    }
+
+    /// Attach every pool to one neuron-addressable `.wbrain` container.
+    /// Existing neurons remain live until the explicit idle transition.
+    pub fn attach_wbrain<P: AsRef<std::path::Path>>(&mut self, path: P) -> std::io::Result<usize> {
+        let file = crate::store::WbrainFile::open(path)?;
+        let mut attached = 0;
+        for pid in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pid) {
+                let store = file.pool(pid);
+                store.set_index_concept_labels(pid == self.binding_pool_id);
+                pool.write().set_wbrain_store(store);
+                attached += 1;
+            }
+        }
+        self.wbrain_file = Some(file);
+        Ok(attached)
+    }
+
+    fn stage_wbrain_brain_metadata(&self, file: &crate::store::WbrainFile) -> std::io::Result<()> {
+        use self::wbrain_metadata::{PersistedMomentFingerprint, WbrainBrainMetadata};
+        if !self.binding_sequence_index.is_empty() {
+            // Not silent: the only caller flushes first, so a non-empty
+            // overlay here means a new staging path skipped the flush and
+            // these routes would live only in the generation that was never
+            // written.
+            tracing::warn!(
+                "staging .wbrain metadata with {} unflushed sequence routes; \
+                 flush_binding_posting_overlay must run first",
+                self.binding_sequence_index.len()
+            );
+        }
+        let persist = |fingerprint: &MomentFingerprint| PersistedMomentFingerprint {
+            pairs: fingerprint.pairs(),
+            ordered_per_pool: fingerprint.ordered_per_pool.clone(),
+            members_per_pool: fingerprint.members_per_pool(),
+        };
+        let metadata = WbrainBrainMetadata {
+            config: self.config.clone(),
+            binding_pool_id: self.binding_pool_id,
+            moment_history: self.moment_history.iter().map(|f| persist(f)).collect(),
+            binding_recurrences: self
+                .binding_recurrences
+                .iter()
+                .map(|(fingerprint, count)| (persist(fingerprint), *count))
+                .collect(),
+            lifetime_recurrences: self
+                .lifetime_recurrences
+                .iter()
+                .map(|(fingerprint, count)| (persist(fingerprint), *count))
+                .collect(),
+            tentative_promoted: self
+                .tentative_promoted
+                .iter()
+                .map(|(fingerprint, id)| (persist(fingerprint), *id))
+                .collect(),
+            promoted_fingerprints: self
+                .promoted_fingerprints
+                .iter()
+                .map(|(fingerprint, id)| (persist(fingerprint), *id))
+                .collect(),
+            // This vector's wire type is the legacy full-key one and is kept
+            // so every existing `.wbrain` manifest still deserializes. It is
+            // now always written empty: `serialize_all_neurons_for_idle`
+            // flushes the overlay into a hashed posting generation
+            // immediately before staging, and a digest-keyed overlay cannot
+            // reproduce the sequences this shape wants. `restore_wbrain`
+            // converts a legacy non-empty vector into digests.
+            binding_sequence_index: Vec::new(),
+            binding_feature_atom_index: self
+                .binding_feature_atom_index
+                .iter()
+                .map(|(key, ids)| (*key, ids.clone()))
+                .collect(),
+            binding_motif_index: self
+                .binding_motif_index
+                .iter()
+                .map(|(key, ids)| (*key, ids.clone()))
+                .collect(),
+            // The existing bincode metadata schema has one generation
+            // vector. Preserve that wire format by persisting the union and
+            // partitioning it from generation markers during restore.
+            binding_posting_indexes: {
+                let mut references = self.binding_posting_indexes.clone();
+                for reference in &self.fingerprint_posting_indexes {
+                    if !references.contains(reference) {
+                        references.push(*reference);
+                    }
+                }
+                for reference in &self.fingerprint_candidate_indexes {
+                    if !references.contains(reference) {
+                        references.push(*reference);
+                    }
+                }
+                references
+            },
+            total_observations: self.total_observations,
+            current_threshold: self.current_threshold,
+            last_pressure_check_obs: self.last_pressure_check_obs,
+            action_pool_id: self.action_pool_id,
+            pending_actions: self
+                .pending_actions
+                .iter()
+                .map(|(id, event)| (*id, event.clone()))
+                .collect(),
+            next_action_id: self.next_action_id,
+            eem: self.eem.snapshot(),
+            annealer: self.annealer.snapshot(),
+        };
+        let bytes = bincode::serialize(&metadata)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        file.set_brain_metadata(bytes);
+        Ok(())
+    }
+
+    /// Run the final sleep transition after maintenance: serialize every live
+    /// neuron independently and publish the compact routing manifest.
+    pub fn serialize_all_neurons_for_idle(&mut self) -> std::io::Result<usize> {
+        if self.wbrain_file.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "brain has no .wbrain container attached",
+            ));
+        }
+        self.flush_binding_posting_overlay()?;
+        let file = self.wbrain_file.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "brain has no .wbrain container attached",
+            )
+        })?;
+        self.stage_wbrain_brain_metadata(file)?;
+        let mut serialized = 0;
+        for pid in self.fabric.pool_ids() {
+            if let Some(pool) = self.fabric.pool(pid) {
+                let mut pool = pool.write();
+                serialized += pool.serialize_all_neurons_for_idle()?;
+                pool.stage_wbrain_metadata()?;
+            }
+        }
+        file.set_tick(self.fabric.current_tick());
+        file.commit_manifest()?;
+        file.flush()?;
+        self.publish_wal_snapshot_barrier();
+        Ok(serialized)
+    }
+
+    /// Record that the container now covers everything the WAL has replayed.
+    ///
+    /// `Brain::checkpoint` (the legacy `brain.bin` path) has always emitted a
+    /// `SnapshotMarker` here, but `serialize_all_neurons_for_idle` -- the
+    /// `.wbrain` path production actually runs -- did not. Recovery reads
+    /// `load_events_after_marker`, so without a fresh marker every restart
+    /// replayed from a stale one and landed at a tick BEHIND the committed
+    /// container. Measured 2026-08-20: trained and recalled 60/60 corpus rows
+    /// exactly, checkpointed with `ok: true`, restarted, and got 0/60 back
+    /// with the tick down ~10,000. That is why admission gates kept seeing an
+    /// untrained brain no matter what was fed to it.
+    ///
+    /// Best-effort by design: the container is already committed and durable
+    /// at this point, so a WAL bookkeeping failure must not fail the
+    /// checkpoint. It is logged and the next barrier supersedes it.
+    fn publish_wal_snapshot_barrier(&self) {
+        // A NoopStore (no WAL attached) makes every call below inert.
+        let store = self.fabric.store_clone();
+        if let Err(error) = store.flush() {
+            tracing::warn!("WAL flush before .wbrain marker failed: {}", error);
+            return;
+        }
+        let wall_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0);
+        let marker = crate::store::WalEvent::SnapshotMarker {
+            tick: self.fabric.current_tick(),
+            wall_time_ms,
+        };
+        if let Err(error) = store.append(&marker) {
+            tracing::warn!("WAL marker append failed for .wbrain commit: {}", error);
+            return;
+        }
+        if let Err(error) = store.flush() {
+            tracing::warn!("WAL flush after .wbrain marker failed: {}", error);
+            return;
+        }
+        if let Err(error) = store.compact_after_checkpoint() {
+            tracing::warn!("WAL compaction after .wbrain commit failed: {}", error);
+        }
+    }
+
+    pub fn uses_wbrain_storage(&self) -> bool {
+        self.wbrain_file.is_some()
+    }
+
+    pub fn binding_posting_residency(&self) -> (usize, usize) {
+        let overlay_entries = self
+            .binding_sequence_index
+            .values()
+            .chain(self.binding_feature_atom_index.values())
+            .chain(self.binding_feature_pair_index.values())
+            .chain(self.binding_motif_index.values())
+            .map(Vec::len)
+            .sum();
+        (overlay_entries, self.binding_posting_indexes.len())
+    }
+
+    pub fn fingerprint_state_residency(&self) -> (usize, usize) {
+        let overlay_entries = self
+            .lifetime_recurrences
+            .len()
+            .saturating_add(self.tentative_promoted.len())
+            .saturating_add(self.promoted_fingerprints.len());
+        let disk_generations = self.fingerprint_posting_indexes.len();
+        (overlay_entries, disk_generations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fingerprint_candidate_generation_count(&self) -> usize {
+        self.fingerprint_candidate_indexes.len()
+    }
+
+    /// Stage 17.4 full — run one eviction pass per
+    /// [`ARCHITECTURE.md`] §17.4.  Walks each pool, identifies concept
+    /// neurons with low `salience_ema` AND staleness past `min_stale_ticks`,
+    /// and evicts up to `target_per_pool` of them (lowest-salience first).
+    ///
+    /// Atoms are never evicted (refused by `Pool::evict_neuron`).  The
+    /// binding pool is skipped entirely — bindings are the answer keys.
+    ///
+    /// **Stage 17.2 — Hebbian disk layout:** after the salience-sort
+    /// pre-filter, candidates are *reordered* by a co-firing proxy
+    /// (shared terminal targets) so neurons that fire together land at
+    /// adjacent byte offsets in the cold-tier file.  The OS read-ahead
+    /// prefetcher then pulls in their neighbors for free when one is
+    /// paged back in.  This is Mountcastle's (1997) cortical-column
+    /// principle applied to disk layout: physical proximity matches
+    /// feature proximity.
+    ///
+    /// Returns `EvictionStats { pools_visited, neurons_evicted,
+    /// errors, wall_time_ms }`.
+    pub fn run_eviction_pass(&self, params: EvictionParams) -> EvictionStats {
+        let started = std::time::Instant::now();
+        let now = self.fabric.current_tick();
+        let pool_ids = self.fabric.pool_ids();
+        let mut stats = EvictionStats::default();
+
+        for pid in pool_ids {
+            // Skip binding pool — bindings are answer keys, must stay hot.
+            if pid == self.binding_pool_id {
+                continue;
+            }
+            let Some(pool_arc) = self.fabric.pool(pid) else {
+                continue;
+            };
+            stats.pools_visited += 1;
+
+            // Phase 1 (read): identify candidates + collect their terminal
+            // target sets for the §17.2 co-firing reorder.  Brief read lock.
+            let candidates_ordered: Vec<NeuronId> = {
+                let p = pool_arc.read();
+                // First filter by salience + staleness.
+                let mut filtered: Vec<(NeuronId, f32, u64, Vec<NeuronRef>)> = p
+                    .iter_neurons()
+                    .filter(|n| !n.is_atom())
+                    .filter(|n| !p.is_evicted(n.id))
+                    .filter(|n| n.salience_ema < params.max_salience_ema)
+                    .filter(|n| now.saturating_sub(n.last_fired_tick) >= params.min_stale_ticks)
+                    .map(|n| {
+                        let tgts: Vec<NeuronRef> = n.terminals.iter().map(|t| t.target).collect();
+                        (n.id, n.salience_ema, n.last_fired_tick, tgts)
+                    })
+                    .collect();
+                // Pre-sort: lowest salience first, ties by oldest last_fired.
+                filtered.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                filtered.truncate(params.target_per_pool);
+                if filtered.is_empty() {
+                    Vec::new()
+                } else {
+                    // §17.2 reorder: greedy nearest-neighbour by Jaccard
+                    // similarity of terminal target sets.  Start from the
+                    // lowest-salience candidate; each subsequent step
+                    // picks the remaining candidate that shares the most
+                    // terminal targets with the previous.  Co-fired
+                    // neurons (high target overlap) cluster adjacently
+                    // in the output order, which determines their disk
+                    // offset on append to cold tier.
+                    use std::collections::HashSet;
+                    let n = filtered.len();
+                    let target_sets: Vec<HashSet<NeuronRef>> = filtered
+                        .iter()
+                        .map(|(_, _, _, tgts)| tgts.iter().copied().collect())
+                        .collect();
+                    let mut chosen: Vec<bool> = vec![false; n];
+                    let mut order: Vec<NeuronId> = Vec::with_capacity(n);
+                    // Seed: lowest-salience (= filtered[0]).
+                    order.push(filtered[0].0);
+                    chosen[0] = true;
+                    for _ in 1..n {
+                        // Find the previous chosen candidate's target set.
+                        let last_idx = order
+                            .last()
+                            .and_then(|nid| filtered.iter().position(|(i, _, _, _)| i == nid))
+                            .unwrap_or(0);
+                        let prev_set = &target_sets[last_idx];
+                        let mut best: Option<(usize, f32)> = None;
+                        for i in 0..n {
+                            if chosen[i] {
+                                continue;
+                            }
+                            let ts = &target_sets[i];
+                            // Jaccard: |A∩B| / |A∪B|; constant when both
+                            // are empty, but we don't reorder isolated
+                            // neurons by anything other than salience tiebreak.
+                            let inter = prev_set.intersection(ts).count() as f32;
+                            let union = prev_set.union(ts).count() as f32;
+                            let j = if union == 0.0 { 0.0 } else { inter / union };
+                            match best {
+                                None => best = Some((i, j)),
+                                Some((_, bj)) if j > bj => best = Some((i, j)),
+                                _ => {}
+                            }
+                        }
+                        if let Some((idx, _)) = best {
+                            order.push(filtered[idx].0);
+                            chosen[idx] = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    order
+                }
+            };
+            if candidates_ordered.is_empty() {
+                continue;
+            }
+
+            // Phase 2 (write): evict each in the Hebbian-locality order.
+            // Cold-tier file appends in this exact order → co-fired
+            // neurons share disk pages → OS prefetcher pulls neighbours
+            // for free on subsequent page-in.
+            {
+                let mut p = pool_arc.write();
+                for cid in candidates_ordered {
+                    match p.evict_neuron(cid) {
+                        Ok(true) => {
+                            stats.neurons_evicted += 1;
+                        }
+                        Ok(false) => { /* already evicted or atom */ }
+                        Err(e) => {
+                            tracing::warn!("evict_neuron(pool={}, id={}) failed: {}", pid, cid, e,);
+                            stats.errors += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        stats.wall_time_ms = started.elapsed().as_millis() as u64;
+        stats
+    }
+
+    /// Stage 17.8 — observable signals for storage-tier dynamical
+    /// control.  Per [`ARCHITECTURE.md`] §17.8, the same control
+    /// architecture (ControlMode/ControlSignal/ControlState) that
+    /// governs the substrate's plasticity knobs also governs the
+    /// storage tier; this method computes the storage-tier
+    /// observables that future knobs (eviction, replay rate, bloom
+    /// resize) read from.
+    ///
+    /// Today (Stage 17.8): the salience-distribution-entropy and
+    /// bloom-load signals are populated from real state; working-set-
+    /// pressure / cache-hit-rate / replay-value remain 0.0 until
+    /// Stage 17.4 full (eviction actor) and Stage 17.7 full
+    /// (free-energy replay) ship.
+    pub fn storage_control_state(&self) -> crate::store::StorageControlState {
+        // Histogram the salience distribution across all neurons in all
+        // pools.  10 bins from 0.0 to 1.0 → 0.1 wide each.  Shannon
+        // entropy in bits over this histogram is the diversity signal.
+        const NBINS: usize = 10;
+        let mut bins = [0u64; NBINS];
+        let mut bloom_inserted: u64 = 0;
+        let mut bloom_slots: u64 = 0;
+        let mut total_neurons: u64 = 0;
+        let mut evicted_neurons: u64 = 0;
+        for pid in self.fabric.pool_ids() {
+            if let Some(p) = self.fabric.pool(pid) {
+                let pool = p.read();
+                for n in pool.iter_neurons() {
+                    let s = n.salience.clamp(0.0, 1.0);
+                    let idx = ((s * NBINS as f32) as usize).min(NBINS - 1);
+                    bins[idx] += 1;
+                }
+                bloom_inserted += pool.bloom_inserted_keys() as u64;
+                // Bloom slot count is a function of the bloom — fetch
+                // via byte_size * 2 (4-bit counters → 2 slots per byte).
+                bloom_slots += (pool.bloom_byte_size() as u64) * 2;
+                total_neurons += pool.neuron_count() as u64;
+                evicted_neurons += pool.evicted_count() as u64;
+            }
+        }
+        let entropy = crate::store::StorageControlState::entropy_from_bins(&bins);
+        let load = if bloom_slots > 0 {
+            (bloom_inserted as f32 / bloom_slots as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Stage 17.4 full: working_set_pressure = live / total.  1.0 means
+        // every neuron is in RAM (full pressure to evict); 0.0 means all
+        // evicted.  Caller's ControlMode interprets — typically
+        // "DrivenBy(working_set_pressure, scale, offset)" makes eviction
+        // more aggressive as pressure climbs.
+        let ws_pressure = if total_neurons > 0 {
+            ((total_neurons - evicted_neurons) as f32 / total_neurons as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        crate::store::StorageControlState {
+            working_set_pressure: ws_pressure,
+            cache_hit_rate: 0.0,     // §17.4 step 2 deferred
+            replay_value_score: 0.0, // §17.7 full
+            salience_distribution_entropy: entropy,
+            bloom_load: load,
+        }
+    }
+
+    /// Rebuild a brain from a snapshot, supplying fresh encodings
+    /// for every pool id in the snapshot.  The binding pool is
+    /// included in `encodings`; pass a `BytePassthroughEncoding`
+    /// matching the original prefix (`"bind"` for default brains).
+    ///
+    /// Returns `(brain, missing_pool_ids)` where `missing_pool_ids`
+    /// lists pool ids in the snapshot for which no encoding was
+    /// supplied — those pools are silently skipped.  Callers should
+    /// treat a non-empty missing list as a misconfiguration.
+    pub fn from_snapshot(
+        snap: crate::persistence::BrainSnapshot,
+        encodings: std::collections::HashMap<PoolId, Box<dyn AtomEncoding>>,
+    ) -> (Self, Vec<PoolId>) {
+        let (fabric, missing) = Fabric::from_snapshot(snap.fabric, encodings);
+        let config = BrainConfig {
+            fabric: fabric.config.clone(),
+            binding_emergence_threshold: snap.binding_emergence_threshold,
+            tentative_emergence_threshold: snap.tentative_emergence_threshold,
+            moment_history_window: snap.moment_history_window,
+            min_atom_score: default_min_atom_score(),
+            pressure_band_low: default_pressure_band_low(),
+            pressure_band_high: default_pressure_band_high(),
+            pressure_threshold_max: default_pressure_threshold_max(),
+            pressure_observation_grace: default_pressure_observation_grace(),
+            pressure_adjust_enabled: default_pressure_adjust_enabled(),
+            binding_pool_config: PoolConfig::defaults("binding", snap.binding_pool_id),
+            eem: snap.eem.config.clone(),
+            annealer: snap.annealer.config.clone(),
+        };
+
+        // Legacy bincode snapshots persist only the canonical pair signature.
+        let legacy = |f: crate::persistence::SerializableFingerprint| -> FpKey {
+            std::sync::Arc::new(MomentFingerprint {
+                legacy_pairs: Some(f.pairs),
+                ordered_per_pool: Vec::new(),
+                members_extra: Vec::new(),
+            })
+        };
+        let mut moment_history = VecDeque::with_capacity(snap.moment_history_window);
+        for f in snap.moment_history {
+            moment_history.push_back(legacy(f));
+        }
+        let mut binding_recurrences = AHashMap::new();
+        for (f, c) in snap.binding_recurrences {
+            binding_recurrences.insert(legacy(f), c);
+        }
+        let mut promoted_fingerprints = AHashMap::new();
+        for (f, n) in snap.promoted_fingerprints {
+            promoted_fingerprints.insert(legacy(f), n);
+        }
+        let mut tentative_promoted = AHashMap::new();
+        for (f, n) in snap.tentative_promoted {
+            tentative_promoted.insert(legacy(f), n);
+        }
+        let mut lifetime_recurrences = AHashMap::new();
+        for (f, c) in snap.lifetime_recurrences {
+            lifetime_recurrences.insert(legacy(f), c);
+        }
+        let mut pending_actions = AHashMap::new();
+        for (k, v) in snap.pending_actions {
+            pending_actions.insert(k, v);
+        }
+
+        let restored_threshold = if snap.current_threshold == 0 {
+            snap.binding_emergence_threshold.max(1)
+        } else {
+            snap.current_threshold
+        };
+        let tentative_binding_count_total = tentative_promoted.len();
+        let consolidated_binding_count_total = promoted_fingerprints.len();
+        let mut brain = Self {
+            fabric,
+            config,
+            wbrain_file: None,
+            overlay_flush_entry_limit: DEFAULT_OVERLAY_FLUSH_ENTRY_LIMIT,
+            overlay_flushes: 0,
+            overlay_flush_errors: 0,
+            binding_pool_id: snap.binding_pool_id,
+            moment_history,
+            binding_recurrences,
+            lifetime_recurrences,
+            tentative_promoted,
+            promoted_fingerprints,
+            tentative_binding_count_total,
+            consolidated_binding_count_total,
+            binding_sequence_index: AHashMap::new(),
+            binding_feature_atom_index: AHashMap::new(),
+            binding_feature_pair_index: AHashMap::new(),
+            binding_motif_index: AHashMap::new(),
+            binding_posting_indexes: Vec::new(),
+            fingerprint_posting_indexes: Vec::new(),
+            fingerprint_candidate_indexes: Vec::new(),
+            total_observations: snap.total_observations,
+            current_threshold: restored_threshold,
+            last_pressure_check_obs: snap.total_observations,
+            action_pool_id: snap.action_pool_id,
+            pending_actions,
+            next_action_id: snap.next_action_id,
+            emitted_this_tick: ahash::AHashSet::new(),
+            eem: crate::eem::Eem::from_snapshot(snap.eem),
+            annealer: crate::annealer::Annealer::from_snapshot(snap.annealer),
+            network: NetworkState::new(""),
+            qa_db: QaDatabase::new(4096),
+            recent_frames: AHashMap::new(),
+            tuning: TuningState::default(),
+            feedback_loops: Vec::new(),
+            delayed_feedback: Vec::new(),
+            feedback_events_emitted: 0,
+            derivation_probe_budget: DEFAULT_DERIVATION_PROBE_BUDGET,
+            derivation_last_continuations: None,
+            derivation_found_taught_subquestion: None,
+            relation_transfer_in_answer_path: true,
+            derivation_cut_hints: Vec::new(),
+            derivation_splice_hints: Vec::new(),
+            trained_episode_bindings: ahash::AHashMap::new(),
+            derivation_stats: DerivationStats::default(),
+            posting_caps: PostingCapCounters::default(),
+        };
+        brain.rebuild_binding_sequence_index();
+        (brain, missing)
+    }
+
+    /// Open a brain directly from its compact `.wbrain` manifest. Pool
+    /// address spaces are rebuilt, but every neuron body remains asleep.
+    pub fn restore_wbrain<P: AsRef<std::path::Path>>(
+        path: P,
+        mut encodings: std::collections::HashMap<PoolId, Box<dyn AtomEncoding>>,
+    ) -> std::io::Result<(Self, Vec<PoolId>)> {
+        use self::wbrain_metadata::{PersistedMomentFingerprint, WbrainBrainMetadata};
+        let file = crate::store::WbrainFile::open(path)?;
+        let metadata: WbrainBrainMetadata = bincode::deserialize(&file.brain_metadata())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let restore_fingerprint = |fingerprint: PersistedMomentFingerprint| -> FpKey {
+            let members_extra = MomentFingerprint::extra_from_full(
+                &fingerprint.ordered_per_pool,
+                fingerprint.members_per_pool,
+            );
+            // A record with an ordered stream derives its signature; one
+            // without is the legacy pair-only shape and keeps its list.
+            let legacy_pairs =
+                fingerprint.ordered_per_pool.is_empty().then_some(fingerprint.pairs);
+            std::sync::Arc::new(MomentFingerprint {
+                legacy_pairs,
+                ordered_per_pool: fingerprint.ordered_per_pool,
+                members_extra,
+            })
+        };
+        let mut fabric = Fabric::new(metadata.config.fabric.clone());
+        let mut missing = Vec::new();
+        for pool_id in file.pool_ids() {
+            let Some(encoding) = encodings.remove(&pool_id) else {
+                missing.push(pool_id);
+                continue;
+            };
+            let store = file.pool(pool_id);
+            store.set_index_concept_labels(pool_id == metadata.binding_pool_id);
+            let pool = Pool::from_wbrain_store(encoding, store)?;
+            fabric.register_pool(pool);
+        }
+        fabric.set_tick(file.tick());
+
+        let tentative_binding_count_total = metadata.tentative_promoted.len();
+        let consolidated_binding_count_total = metadata.promoted_fingerprints.len();
+        let fingerprint_store = file.pool(metadata.binding_pool_id);
+        let mut binding_posting_indexes = Vec::new();
+        let mut fingerprint_posting_indexes = Vec::new();
+        let mut fingerprint_candidate_indexes = Vec::new();
+        for reference in metadata.binding_posting_indexes.iter().copied() {
+            let has_fingerprint_state = crate::store::posting_index::lookup(
+                &fingerprint_store,
+                reference,
+                FINGERPRINT_STATE_MARKER_KEY,
+                1,
+            );
+            let fingerprint_only = crate::store::posting_index::lookup(
+                &fingerprint_store,
+                reference,
+                FINGERPRINT_ONLY_GENERATION_KEY,
+                1,
+            );
+            let candidate_only = crate::store::posting_index::lookup(
+                &fingerprint_store,
+                reference,
+                FINGERPRINT_CANDIDATE_GENERATION_KEY,
+                1,
+            );
+            let hashed_scalar = crate::store::posting_index::lookup(
+                &fingerprint_store,
+                reference,
+                FINGERPRINT_HASHED_SCALAR_GENERATION_KEY,
+                1,
+            );
+            match (
+                has_fingerprint_state,
+                fingerprint_only,
+                candidate_only,
+                hashed_scalar,
+            ) {
+                (Ok(state), Ok(only), Ok(candidate), Ok(hashed)) => {
+                    if !candidate.is_empty() {
+                        fingerprint_candidate_indexes.push(reference);
+                        continue;
+                    }
+                    if !state.is_empty() {
+                        fingerprint_posting_indexes.push(reference);
+                        // Legacy combined and first-generation split state
+                        // records retain full keys and remain enumerable.
+                        if hashed.is_empty() {
+                            fingerprint_candidate_indexes.push(reference);
+                        }
+                    }
+                    // Legacy generations with fingerprint state predate the
+                    // discriminator and also contain binding routes. New
+                    // fingerprint-only deltas are excluded from point lookup.
+                    if only.is_empty() {
+                        binding_posting_indexes.push(reference);
+                    }
+                }
+                (state, only, candidate, hashed) => {
+                    tracing::warn!(
+                        "conservatively retaining unreadable posting generation in all indexes: \
+                         state={:?} only={:?} candidate={:?} hashed={:?}",
+                        state.err(),
+                        only.err(),
+                        candidate.err(),
+                        hashed.err()
+                    );
+                    binding_posting_indexes.push(reference);
+                    fingerprint_posting_indexes.push(reference);
+                    fingerprint_candidate_indexes.push(reference);
+                }
+            }
+        }
+        let mut brain = Self {
+            fabric,
+            config: metadata.config,
+            wbrain_file: Some(file),
+            overlay_flush_entry_limit: DEFAULT_OVERLAY_FLUSH_ENTRY_LIMIT,
+            overlay_flushes: 0,
+            overlay_flush_errors: 0,
+            binding_pool_id: metadata.binding_pool_id,
+            moment_history: metadata
+                .moment_history
+                .into_iter()
+                .map(restore_fingerprint)
+                .collect(),
+            binding_recurrences: metadata
+                .binding_recurrences
+                .into_iter()
+                .map(|(fingerprint, count)| (restore_fingerprint(fingerprint), count))
+                .collect(),
+            lifetime_recurrences: metadata
+                .lifetime_recurrences
+                .into_iter()
+                .map(|(fingerprint, count)| (restore_fingerprint(fingerprint), count))
+                .collect(),
+            tentative_promoted: metadata
+                .tentative_promoted
+                .into_iter()
+                .map(|(fingerprint, id)| (restore_fingerprint(fingerprint), id))
+                .collect(),
+            promoted_fingerprints: metadata
+                .promoted_fingerprints
+                .into_iter()
+                .map(|(fingerprint, id)| (restore_fingerprint(fingerprint), id))
+                .collect(),
+            tentative_binding_count_total,
+            consolidated_binding_count_total,
+            // Migration: a manifest written before the overlay was keyed by
+            // digest carries full `(query, target, sequence)` keys. Hash each
+            // one into the digest the live index and every posting generation
+            // agree on, so a legacy overlay keeps resolving its routes.
+            binding_sequence_index: metadata
+                .binding_sequence_index
+                .into_iter()
+                .map(|((query, target, sequence), ids)| {
+                    (sequence_route_digest(query, target, &sequence), ids)
+                })
+                .collect(),
+            binding_feature_atom_index: metadata.binding_feature_atom_index.into_iter().collect(),
+            binding_feature_pair_index: AHashMap::new(),
+            binding_motif_index: metadata.binding_motif_index.into_iter().collect(),
+            binding_posting_indexes,
+            fingerprint_posting_indexes,
+            fingerprint_candidate_indexes,
+            total_observations: metadata.total_observations,
+            current_threshold: metadata.current_threshold,
+            last_pressure_check_obs: metadata.last_pressure_check_obs,
+            action_pool_id: metadata.action_pool_id,
+            pending_actions: metadata.pending_actions.into_iter().collect(),
+            next_action_id: metadata.next_action_id,
+            emitted_this_tick: ahash::AHashSet::new(),
+            eem: crate::eem::Eem::from_snapshot(metadata.eem),
+            annealer: crate::annealer::Annealer::from_snapshot(metadata.annealer),
+            network: NetworkState::new(""),
+            qa_db: QaDatabase::new(4096),
+            recent_frames: AHashMap::new(),
+            tuning: TuningState::default(),
+            feedback_loops: Vec::new(),
+            delayed_feedback: Vec::new(),
+            feedback_events_emitted: 0,
+            derivation_probe_budget: DEFAULT_DERIVATION_PROBE_BUDGET,
+            derivation_last_continuations: None,
+            derivation_found_taught_subquestion: None,
+            relation_transfer_in_answer_path: true,
+            derivation_cut_hints: Vec::new(),
+            derivation_splice_hints: Vec::new(),
+            trained_episode_bindings: ahash::AHashMap::new(),
+            derivation_stats: DerivationStats::default(),
+            posting_caps: PostingCapCounters::default(),
+        };
+        if let Some(count) = brain.disk_scalar(FINGERPRINT_TENTATIVE_COUNT_KEY) {
+            brain.tentative_binding_count_total = count as usize;
+        }
+        if let Some(count) = brain.disk_scalar(FINGERPRINT_PROMOTED_COUNT_KEY) {
+            brain.consolidated_binding_count_total = count as usize;
+        }
+        Ok((brain, missing))
+    }
+
+    /// One-time conversion from the legacy monolithic snapshot. The source
+    /// file is read-only and left untouched; the destination is a separate
+    /// `.wbrain` container whose neurons are individually addressable.
+    pub fn migrate_legacy_checkpoint<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        legacy_path: P,
+        wbrain_path: Q,
+        encodings: std::collections::HashMap<PoolId, Box<dyn AtomEncoding>>,
+    ) -> std::io::Result<(usize, Vec<PoolId>)> {
+        let (mut brain, missing) = Self::restore(legacy_path, encodings)?;
+        if !missing.is_empty() {
+            return Ok((0, missing));
+        }
+        brain.attach_wbrain(wbrain_path)?;
+        let serialized = brain.serialize_all_neurons_for_idle()?;
+        Ok((serialized, missing))
+    }
+
+    /// Bounded-memory legacy conversion. Unlike `migrate_legacy_checkpoint`,
+    /// this never constructs a resident Brain and reads one neuron at a time.
+    pub fn migrate_legacy_checkpoint_streaming<
+        P: AsRef<std::path::Path>,
+        Q: AsRef<std::path::Path>,
+    >(
+        legacy_path: P,
+        wbrain_path: Q,
+    ) -> std::io::Result<usize> {
+        // Streaming conversion performs sustained seek/read/append phases and
+        // publishes resumability metadata between them. Serializing process-
+        // local migrations prevents competing conversions from creating I/O
+        // starvation windows that look like a truncated legacy checkpoint.
+        // Cross-process safety remains the caller's runtime-ownership duty.
+        static STREAMING_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _migration = STREAMING_MIGRATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        streaming_migration::migrate(legacy_path.as_ref(), wbrain_path.as_ref())
+    }
+
+    /// True when an incomplete `.wbrain` contains a durable migration
+    /// boundary that matches the legacy checkpoint and can be resumed.
+    pub fn legacy_migration_is_resumable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        legacy_path: P,
+        wbrain_path: Q,
+    ) -> bool {
+        streaming_migration::is_resumable(legacy_path.as_ref(), wbrain_path.as_ref())
+    }
+
+    /// True when raw neuron conversion and its final brain metadata are
+    /// complete, even if derived-index finalization has not yet finished.
+    pub fn legacy_migration_raw_is_complete<P: AsRef<std::path::Path>>(wbrain_path: P) -> bool {
+        streaming_migration::is_raw_complete(wbrain_path.as_ref())
+    }
+
+    /// Load a brain from `path`.  Convenience wrapper over
+    /// `persistence::load_snapshot()` + `from_snapshot()`.
+    pub fn restore<P: AsRef<std::path::Path>>(
+        path: P,
+        encodings: std::collections::HashMap<PoolId, Box<dyn AtomEncoding>>,
+    ) -> std::io::Result<(Self, Vec<PoolId>)> {
+        let snap = crate::persistence::load_snapshot(path)?;
+        Ok(Self::from_snapshot(snap, encodings))
+    }
+
+    pub fn stats(&self) -> BrainStats {
+        let mut stats = BrainStats {
+            tick: self.fabric.current_tick(),
+            pool_count: 0,
+            total_neurons: 0,
+            total_concepts: 0,
+            total_binding: 0,
+            total_terminals: 0,
+            resident_terminals: 0,
+            evicted_neurons: 0,
+            page_outs: 0,
+            page_ins: 0,
+            clean_skips: 0,
+            binding_pool_id: self.binding_pool_id,
+            fingerprints_window: self.moment_history.len(),
+            tentative_bindings: self.tentative_binding_count_total,
+            consolidated_bindings: self.consolidated_binding_count_total,
+            current_threshold: self.current_threshold,
+            total_observations: self.total_observations,
+            binding_pressure: self.binding_pressure(),
+        };
+        for pid in self.fabric.pool_ids() {
+            if let Some(p) = self.fabric.pool(pid) {
+                let pool = p.read();
+                stats.pool_count += 1;
+                let nc = pool.neuron_count();
+                stats.total_neurons += nc;
+                let cc = pool.concept_count();
+                stats.total_concepts += cc;
+                // O(1) — maintained terminal counter (was O(N) walk
+                // before pool.total_terminals was introduced).
+                stats.total_terminals += pool.total_terminals();
+                stats.resident_terminals += pool.resident_terminal_count();
+                stats.evicted_neurons += pool.evicted_count();
+                let (page_outs, clean_skips) = pool.store_page_out_counters();
+                stats.page_outs += page_outs;
+                stats.clean_skips += clean_skips;
+                stats.page_ins += pool.wbrain_page_ins();
+                if pid == self.binding_pool_id {
+                    stats.total_binding += cc;
+                }
+            }
+        }
+        stats
+    }
+}
+
+#[cfg(test)]
+mod decode_shape_tests {
+    use super::{decode_is_runaway_tiling, tiled_fraction};
+
+    /// Runaway emergence tiles a short block; that is the signal to reject on.
+    #[test]
+    fn periodic_tilings_are_rejected() {
+        for payload in [
+            &b"animalanimalanimal"[..],
+            &b"bodybodybodybody"[..],
+            &b"alaalaalaalaala"[..],
+            &b"oooooooooooooooo"[..],
+        ] {
+            assert!(
+                decode_is_runaway_tiling(payload),
+                "{:?} should be rejected, fraction {}",
+                String::from_utf8_lossy(payload),
+                tiled_fraction(payload),
+            );
+        }
+    }
+
+    /// The property the old length filters broke: a correct answer may be an
+    /// entire source file, and size must not decide whether it is returned.
+    #[test]
+    fn real_source_is_kept_at_any_length() {
+        let module = concat!(
+            "from django.apps import AppConfig\n\n\n",
+            "class CalculatorConfig(AppConfig):\n",
+            "    default_auto_field = \"django.db.models.BigAutoField\"\n",
+            "    name = \"calculator\"\n",
+            "    verbose_name = \"Scientific calculator\"\n\n",
+            "    def ready(self):\n",
+            "        from . import signals  # noqa: F401\n",
+        );
+        assert!(!decode_is_runaway_tiling(module.as_bytes()));
+        assert_eq!(tiled_fraction(module.as_bytes()), 0.0);
+
+        // Same content repeated is still not a tiling of a SHORT block by the
+        // fraction rule only if it genuinely differs; an exact doubling is.
+        let doubled = format!("{module}{module}");
+        assert!(decode_is_runaway_tiling(doubled.as_bytes()));
+
+        // Length alone never rejects: 300 KB of varied content passes.
+        let large: Vec<u8> = (0..300_000_u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        assert!(!decode_is_runaway_tiling(&large));
+    }
+
+    /// Short trained category answers keep working unchanged.
+    #[test]
+    fn short_category_answers_are_unaffected() {
+        for payload in [&b"toy"[..], &b"body"[..], &b"musical_instrument"[..]] {
+            assert!(!decode_is_runaway_tiling(payload));
+        }
+    }
+
+    #[test]
+    fn degenerate_inputs_are_safe() {
+        assert!(!decode_is_runaway_tiling(b""));
+        assert!(!decode_is_runaway_tiling(b"x"));
+        assert_eq!(tiled_fraction(b""), 0.0);
+        assert_eq!(tiled_fraction(b"x"), 0.0);
+        // Two identical bytes IS a tiling of period 1.
+        assert!(decode_is_runaway_tiling(b"xx"));
+    }
+}
+
+#[cfg(test)]
+mod sequence_route_digest_tests {
+    use super::{
+        encode_sequence_posting_key, sequence_route_digest, BindingPostingKey, SequenceRouteDigest,
+    };
+    use crate::store::posting_index::POSTING_KEY_DIGEST_BYTES;
+
+    /// The overlay key and the on-disk record must be derived from the same
+    /// bytes. If they drift, a flush silently stops answering the query that
+    /// wrote it -- the overlay is cleared, the generation exists, and recall
+    /// just returns nothing.
+    #[test]
+    fn overlay_key_matches_what_a_posting_lookup_derives() {
+        for sequence in [
+            vec![],
+            vec![7_u32],
+            (0..64_u32).collect::<Vec<_>>(),
+            (0..4096_u32).map(|i| i.wrapping_mul(7)).collect::<Vec<_>>(),
+        ] {
+            let encoded =
+                BindingPostingKey::Sequence(3, 5, sequence.clone()).encode();
+            assert_eq!(
+                encoded,
+                encode_sequence_posting_key(3, 5, &sequence),
+                "the enum arm and the free encoder must agree"
+            );
+            let expected: SequenceRouteDigest = blake3::hash(&encoded).as_bytes()
+                [..POSTING_KEY_DIGEST_BYTES]
+                .try_into()
+                .unwrap();
+            assert_eq!(sequence_route_digest(3, 5, &sequence), expected);
+        }
+    }
+
+    /// The whole key must be in the digest: pools and sequence order included,
+    /// or two different routes collapse onto one posting list.
+    #[test]
+    fn distinct_routes_have_distinct_digests() {
+        let base = sequence_route_digest(3, 5, &[1, 2, 3]);
+        for other in [
+            sequence_route_digest(5, 3, &[1, 2, 3]),
+            sequence_route_digest(3, 6, &[1, 2, 3]),
+            sequence_route_digest(3, 5, &[3, 2, 1]),
+            sequence_route_digest(3, 5, &[1, 2]),
+            sequence_route_digest(3, 5, &[1, 2, 3, 0]),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    /// A legacy `.wbrain` manifest carries full `(query, target, sequence)`
+    /// overlay keys. The restore migration must land each one on the digest
+    /// the live index and the posting generations both use, so an old overlay
+    /// keeps resolving instead of becoming unreachable.
+    #[test]
+    fn legacy_full_key_overlay_migrates_onto_the_live_digest() {
+        let legacy: Vec<((u32, u32, Vec<u32>), Vec<u32>)> = vec![
+            ((3, 5, vec![11, 12, 13]), vec![901]),
+            ((5, 3, vec![11, 12, 13]), vec![902, 903]),
+        ];
+        let migrated: ahash::AHashMap<SequenceRouteDigest, Vec<u32>> = legacy
+            .clone()
+            .into_iter()
+            .map(|((query, target, sequence), ids)| {
+                (sequence_route_digest(query, target, &sequence), ids)
+            })
+            .collect();
+        assert_eq!(migrated.len(), 2, "the two routes must stay distinct");
+        for ((query, target, sequence), ids) in legacy {
+            assert_eq!(
+                migrated
+                    .get(&sequence_route_digest(query, target, &sequence))
+                    .cloned(),
+                Some(ids)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod hash_table_bytes_tests {
+    use super::hash_table_bytes;
+    use ahash::AHashMap;
+
+    /// `capacity()` is the usable slot count, NOT the bucket count, and every
+    /// census in this crate was charging the first for the second. hashbrown
+    /// keeps one bucket in eight spare, so a map holding 9,728 facts allocates
+    /// 16,384 buckets -- the undercount that let a residual stay unnamed.
+    /// Pin the inversion against the real map rather than against the formula.
+    #[test]
+    fn buckets_are_recovered_from_capacity() {
+        for n in [1usize, 2, 3, 7, 8, 9, 100, 1_000, 9_728] {
+            let mut m: AHashMap<u64, u32> = AHashMap::new();
+            for i in 0..n as u64 {
+                m.insert(i, 0);
+            }
+            let cap = m.capacity();
+            assert!(cap >= n, "capacity {cap} below the {n} entries it holds");
+            let entry = std::mem::size_of::<(u64, u32)>() + 1;
+            let bytes = hash_table_bytes::<u64, u32>(cap);
+            assert_eq!(bytes % entry, 0, "n={n}: {bytes} is not a whole number of buckets");
+            let buckets = bytes / entry;
+            assert!(buckets.is_power_of_two(), "n={n}: {buckets} buckets is not a power of two");
+            assert!(buckets >= cap, "n={n}: {buckets} buckets cannot hold {cap} slots");
+            // Never more than one doubling above what the table needs: a census
+            // that over-charges hides a real structure just as badly as one
+            // that under-charges.
+            assert!(buckets <= 2 * cap.next_power_of_two(),
+                    "n={n}: {buckets} buckets for {cap} slots over-charges");
+        }
+    }
+
+    /// An empty map has no allocation at all, so charging it a minimum bucket
+    /// count would invent bytes. hashbrown's empty table is a static dangling
+    /// pointer; `Brain::new` makes dozens of these.
+    #[test]
+    fn an_empty_table_costs_nothing() {
+        let m: AHashMap<u64, u32> = AHashMap::new();
+        assert_eq!(m.capacity(), 0);
+        assert_eq!(hash_table_bytes::<u64, u32>(0), 0);
+    }
+}
