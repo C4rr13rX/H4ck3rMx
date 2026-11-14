@@ -15,8 +15,14 @@
 1. **A Custom Linux OS for Mobile Hardware:** A native Linux distribution engineered from the ground up for mobile form factors, low-power ARM64 SoCs, touchscreen input, cellular connectivity, and dynamic power management.
 2. **Official Hardware Driver & Firmware Integration:** An automated, verifiable pipeline that pulls, verifies, and packages official drivers, firmware, and kernel updates from official OEM and chipset repositories to ensure maximum device stability and peripheral support (cellular modems, Wi-Fi, Bluetooth, GPU acceleration, cameras, and audio DSPs).
 3. **Hex Adjacency Trust Graph Package Manager:** A revolutionary software distribution and isolation model where each application declares at most six trusted peers (`trusted_peers <= 6`), enforced by multi-party threshold cosignatures (6-of-N cosigners), transparency logs, and kernel-level IPC confinement.
-4. **Agent-First Native UX:** A voice- and chat-orchestrated operating experience optimized for fast mobile interaction, terminal power, and agentic task execution, powered by on-device neural models with optional user-provided cloud API fallbacks.
+4. **Agent-First Native UX (Powered by W1z4rDV1510n):** A voice- and chat-orchestrated operating experience optimized for fast mobile interaction, terminal power, and proactive defense, powered by the CPU/RAM-native, byte-grained Hebbian neural fabric of `W1z4rDV1510n` with optional user-provided cloud API fallbacks.
 5. **Non-Profit, Legally Bulletproof Delivery:** Clear separation between copyleft (GPL kernel sources), permissive open-source (MIT H4ck3rMx core), and proprietary vendor microcode, ensuring legal compliance, transparency, and reproducible builds.
+
+---
+
+## Operating System Engineering Master Plan
+
+The complete 39-pass engineering master plan detailing every layer from bootloader to cognitive substrate against our 7 core priorities (Security, Freedom, Privacy, Anonymity, Community, Modifications, and W1z4rDV1510n Agents) is available in our [Operating System Engineering Master Plan](docs/operating_system_master_plan.md).
 
 ---
 
@@ -75,10 +81,11 @@ Run our bootstrap script to install host dependencies:
 
 ---
 
-## Agent-First Operating Experience
+## Agent-First Operating Experience (W1z4rDV1510n Cognitive Core)
 
-- **Voice and Chat Native:** Built with a primary agentic interface. Users can inspect system logs, query network connections, manage files, configure firewall rules, or interact with apps using conversational commands.
-- **Local Neural Engine:** Engineered for local, on-device inference using quantized neural models running on mobile NPUs and GPUs.
+- **Living, Spiking-Inspired Neural Fabric:** Powered on-device by [W1z4rDV1510n](https://github.com/C4rr13rX/W1z4rDV1510n), a byte-grained Hebbian neural fabric running natively on CPU and RAM with zero GPU requirements, ideal for mobile thermal and battery envelopes.
+- **Voice and Chat Native:** Built with a primary agentic interface. Users can inspect system logs, query network connections, manage files, configure firewall rules, or interact with apps using natural conversational commands.
+- **Strict Read-Only Inference & Safety:** Zero state mutation during predictions, with continuous verification against foundational ethical prerogatives and the Hex Trust Graph.
 - **Sovereign Cloud Keys:** Users may supply their own API keys (OpenAI, Anthropic, Ollama, self-hosted endpoints) for hybrid inference. Keys remain encrypted locally and are never exfiltrated.
 - **Terminal Power:** Full Linux terminal capabilities available at all times (zsh/bash, tmux, SSH, Python, native compilers).
 
